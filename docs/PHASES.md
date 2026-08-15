@@ -115,12 +115,35 @@ A `.env` containing the unedited placeholder `your-api-key-here` is **worse than
 
 A client-facing companion to `docs/DESIGN.md` (which stays as the technical reference). `docs/index.html` is a self-contained, single-file HTML page — no external requests, no build step — built around the real Phase 2a scan output: the actual `pickle.loads` finding as the hero diff, the actual 3-file/16-finding/severity-split numbers, and an honest complement-not-replace framing against Semgrep/Bandit/tfsec. Meant to be hosted directly via GitHub Pages (`main` / `/docs`) so it doesn't depend on any Claude-hosted link.
 
+### 2f. False-positive measurement ✅ (partial — see open item below)
+
+Tested against three real external codebases, not the vulnerable fixtures:
+
+| Target | Language | Result |
+| --- | --- | --- |
+| `neet` (client-side quiz app) | JS | 0 findings on a 398-line file with 13 `innerHTML` sites and 2 `localStorage` uses — verified by hand that every site is genuinely safe (static literals or content cleared, never interpolated). A real negative, not a lucky one: `innerHTML` is exactly the keyword a naive pattern-matcher flags on sight. |
+| ThePhish (open-source phishing-analysis tool) | Python/JS/YAML | See below. |
+| `teslamotors/vehicle-command` | Go | Not run — 78 files / ~39,600 lines is too large for the free-tier daily quota (20 req/day); needs a paid tier or a deliberately scoped subset. |
+
+**ThePhish, `gemini-3.7-flash` (the default model), partial run** (2 of 11 files before hitting the daily quota): `case_from_email.py` and `list_emails.py` — **0 findings on both**, despite both files reading IMAP/API credentials out of a config dict (`config['imapPassword']`, etc.) in exactly the pattern that later proved to be the dominant false-positive source on a smaller model. This is the strongest single data point that `gemini-3.7-flash` has meaningfully better precision than the lite tier.
+
+**ThePhish, `gemini-2.5-flash-lite` (quota-forced substitute), full run**: 19 findings across 10 files. Manually triaged every finding against the actual source:
+
+- **14 of 19 (~74%) were false positives or miscategorized.** The dominant pattern (8 findings, 42% of the total): every file that reads a secret via `config['x']` was flagged `CWE-798` Hardcoded Credentials — even though the code correctly reads from an external file, and `app/configuration.json` (confirmed by hand) is a template with every secret field set to `""`. The model speculated about a file it never saw, directly violating the system prompt's own "never speculate about code you cannot see" rule. Other false positives: a `UnicodeDecodeError` handling concern mislabeled `CWE-798`; TLP/PAP classification labels (not secrets) mislabeled `CWE-798`; a jQuery compatibility note mislabeled `CWE-20`; `document.createTextNode()` — a safe DOM API — flagged as "potential XSS" while the finding's own text admits it's safe; and one finding whose suggested "fix" **removed** an existing `flask.escape()` call, actively regressing security.
+- **5 of 19 were plausible-to-real true positives**, most notably `MYSQL_PASSWORD=example` and `MYSQL_ROOT_PASSWORD=password` — literal weak passwords sitting in the committed `docker-compose.yml`. Also flagged: Elasticsearch security disabled, a Docker-socket mount into Cortex (arguably by-design for its sandboxed-analysis architecture), and unsanitized log data reaching `innerHTML`.
+
+**Prompt tuning** ([`scanner/core.py`](../scanner/core.py)): rewrote `SYSTEM_PROMPT` rule 1 to explicitly state that reading a secret from `config['x']`/`os.environ[...]` is the *correct* pattern, not a finding, and that CWE-798 requires the literal secret value to be visible in the given code. Added a new rule requiring `cwe_id`/`owasp_category` to accurately describe the actual flaw (targeting the mismatched-CWE failures), and tightened the code-patch rule to forbid a "fix" that removes an existing security control (targeting the `flask.escape()` regression).
+
+**Honest result of the re-test**: re-running the identical ThePhish scan with the tuned prompt on `gemini-2.5-flash-lite` made the targeted pattern *worse*, not better — `case_from_email.py` went from 4 to 12 findings, now flagging nearly every individual `config['x']` field (host, port, folder, TLP, PAP, tags) as a separate `CWE-798` finding. It also surfaced two additional, more sophisticated, plausible findings (email attachment filename → path traversal; email subject → stored XSS in a case title) not present in the first run. Read: a lite-tier model likely can't reliably parse a conditional rule ("only flag X if Y") and instead over-indexes on the topic being discussed at all — a model-capability ceiling, not obviously a prompt-wording problem.
+
+**Open item**: the tuned prompt has *not yet* been validated against `gemini-3.7-flash` — the actual default/production model — because its free-tier daily quota (20 req/day) was already exhausted by the time the fix was ready to test. `gemini-3.7-flash` is the model that matters for this question, since it already showed clean judgment on this exact file under the *old* prompt. Re-test once quota resets.
+
 ### Remaining in Phase 2
 
-- Measure false-positive rate on a known-clean codebase.
-- Tune the system prompt based on observed failure modes.
+- Validate the tuned prompt against `gemini-3.7-flash` once quota resets (see 2f above).
 - Add a `--baseline` file to suppress accepted risks.
 - Add SARIF output for GitHub Code Scanning.
+- Fix a real gap the quota wall surfaced: once a *daily* quota is exhausted, the scanner currently retries and fails on every remaining file individually, each producing a near-duplicate wall of 429 text in the failed-files list. It should detect daily-quota exhaustion specifically (distinct from a transient rate limit) and fail the whole run fast with one message instead.
 
 ---
 
