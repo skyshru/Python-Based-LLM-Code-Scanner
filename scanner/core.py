@@ -138,6 +138,15 @@ class MissingAPIKeyError(ScannerError):
     pass
 
 
+class DailyQuotaExceededError(ScannerError):
+    """Raised when the provider's daily request quota is exhausted.
+
+    Unlike a transient rate limit, retrying will not help until the quota
+    resets, so this is never retried and always aborts the whole scan
+    rather than just the current chunk.
+    """
+
+
 class LLMClient(Protocol):
     """Minimal surface the scanner needs; lets tests inject a fake."""
 
@@ -234,6 +243,10 @@ class GeminiClient:
                     raise ScannerError("Model returned an empty response")
                 return text
             except Exception as exc:  # noqa: BLE001 - SDK raises varied types
+                if _is_daily_quota_exhausted(exc):
+                    raise DailyQuotaExceededError(
+                        f"Daily request quota exhausted for model '{self.model}': {exc}"
+                    ) from exc
                 last_error = exc
                 if not _is_retryable(exc) or attempt == self.config.max_retries:
                     break
@@ -268,6 +281,19 @@ _RETRYABLE_MARKERS = (
 def _is_retryable(exc: Exception) -> bool:
     message = f"{type(exc).__name__} {exc}".lower()
     return any(marker in message for marker in _RETRYABLE_MARKERS)
+
+
+# Google's daily-quota error is still nominally a 429 with a short suggested
+# retryDelay, which makes it look retryable — but the quotaId names a PerDay
+# metric, and no amount of short-delay retrying clears a daily cap. Detect it
+# specifically so we fail the whole scan once instead of retrying (and then
+# failing) on every remaining file.
+_DAILY_QUOTA_MARKERS = ("perday",)
+
+
+def _is_daily_quota_exhausted(exc: Exception) -> bool:
+    message = f"{type(exc).__name__} {exc}".lower()
+    return any(marker in message for marker in _DAILY_QUOTA_MARKERS)
 
 
 def build_user_prompt(chunk: CodeChunk) -> str:
@@ -371,6 +397,10 @@ class Scanner:
             try:
                 raw = self.client.generate(SYSTEM_PROMPT, build_user_prompt(chunk))
                 parsed = parse_llm_response(raw)
+            except DailyQuotaExceededError:
+                # Not file-level noise: propagate so scan() can stop the
+                # whole run instead of limping through every remaining file.
+                raise
             except ScannerError as exc:
                 errors.append(str(exc))
                 continue
@@ -420,7 +450,28 @@ class Scanner:
                     error=str(exc),
                 )
             else:
-                result = self.scan_file(source)
+                try:
+                    result = self.scan_file(source)
+                except DailyQuotaExceededError as exc:
+                    # Every remaining file would fail identically, so mark
+                    # them all at once instead of retrying-then-failing each
+                    # one individually.
+                    remaining = paths[i - 1 :]
+                    report.truncated = True
+                    report.truncation_reason = (
+                        f"Stopped after {i - 1} of {len(paths)} files "
+                        f"({len(remaining)} not attempted): {exc}"
+                    )
+                    for skipped_path in remaining:
+                        skipped_result = FileScanResult(
+                            file_path=_display_path(skipped_path, target_path),
+                            scanned=False,
+                            error="skipped: daily API quota exhausted; scan stopped early",
+                        )
+                        report.results.append(skipped_result)
+                        if on_file_done:
+                            on_file_done(skipped_result)
+                    break
 
             report.results.append(result)
             if on_file_done:

@@ -161,6 +161,9 @@ def main(
 
     render_terminal(report, console=console, verbose=not quiet)
 
+    if report.truncated:
+        console.print(f"\n[bold red]scan incomplete:[/bold red] {report.truncation_reason}")
+
     if output:
         try:
             written = write_report(report, output)
@@ -169,6 +172,11 @@ def main(
             sys.exit(EXIT_ERROR)
         console.print(f"\n[green]report written:[/green] {written}")
 
+    if report.truncated:
+        # An incomplete scan must never report as clean or be silently
+        # trusted by CI — surface it as a tool error regardless of whether
+        # the files that WERE scanned had findings.
+        sys.exit(EXIT_ERROR)
     if report.has_actionable_findings and not no_fail:
         sys.exit(EXIT_FINDINGS)
     sys.exit(EXIT_CLEAN)

@@ -46,6 +46,13 @@ def render_markdown(report: ScanReport) -> str:
         f"- **Generated:** {report.generated_at.isoformat()}",
         f"- **Severity threshold:** {report.severity_threshold.value}",
         "",
+    ]
+    if report.truncated:
+        lines += [
+            f"> **⚠ Scan incomplete:** {report.truncation_reason}",
+            "",
+        ]
+    lines += [
         "## Summary",
         "",
         "| Metric | Value |",

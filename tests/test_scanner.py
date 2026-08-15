@@ -8,11 +8,13 @@ from pathlib import Path
 import pytest
 
 from scanner.core import (
+    DailyQuotaExceededError,
     GeminiClient,
     MissingAPIKeyError,
     RateLimitConfig,
     Scanner,
     ScannerError,
+    _is_daily_quota_exhausted,
     _is_retryable,
     build_user_prompt,
     parse_llm_response,
@@ -63,6 +65,24 @@ class FakeClient:
         if len(self._responses) == 1:
             return self._responses[0]
         return self._responses[len(self.calls) - 1]
+
+
+class QuotaExhaustedClient:
+    """Returns `responses` for the first `fail_after` calls, then raises forever."""
+
+    def __init__(self, responses: list[str], fail_after: int):
+        self._responses = responses
+        self._fail_after = fail_after
+        self.calls = 0
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        self.calls += 1
+        if self.calls > self._fail_after:
+            raise DailyQuotaExceededError(
+                "Daily request quota exhausted for model 'x': 429 RESOURCE_EXHAUSTED "
+                "quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+            )
+        return self._responses[self.calls - 1]
 
 
 # --------------------------------------------------------------------------
@@ -358,6 +378,51 @@ def test_scan_progress_callbacks_fire(tmp_path: Path):
     assert seen == ["a.py"]
 
 
+def test_scan_file_propagates_daily_quota_exceeded():
+    class RaisingClient:
+        def generate(self, system_prompt, user_prompt):
+            raise DailyQuotaExceededError("quota gone")
+
+    source = SourceFile(Path("a.py"), "a.py", "python", "x = 1\n")
+    with pytest.raises(DailyQuotaExceededError):
+        Scanner(RaisingClient()).scan_file(source)
+
+
+def test_scan_stops_early_on_daily_quota_exhaustion(tmp_path: Path):
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "b.py").write_text("y = 2\n")
+    (tmp_path / "c.py").write_text("z = 3\n")
+
+    client = QuotaExhaustedClient(
+        responses=[json.dumps({"vulnerabilities": [_finding(severity="CRITICAL")]})],
+        fail_after=1,
+    )
+    report = Scanner(client).scan(tmp_path)
+
+    assert report.truncated is True
+    assert "1 of 3" in report.truncation_reason
+    assert "2 not attempted" in report.truncation_reason
+    assert report.summary.files_discovered == 3
+
+    scanned_with_findings = [r for r in report.results if r.vulnerabilities]
+    assert len(scanned_with_findings) == 1
+
+    skipped = [r for r in report.results if r.error and "quota exhausted" in r.error]
+    assert len(skipped) == 2
+    assert all(not r.scanned for r in skipped)
+
+
+def test_scan_stop_early_still_fires_on_file_done_for_skipped_files(tmp_path: Path):
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "b.py").write_text("y = 2\n")
+
+    client = QuotaExhaustedClient(responses=[], fail_after=0)
+    done: list[str] = []
+    Scanner(client).scan(tmp_path, on_file_done=lambda r: done.append(r.file_path))
+
+    assert done == ["a.py", "b.py"]
+
+
 # --------------------------------------------------------------------------
 # API key / retry handling
 # --------------------------------------------------------------------------
@@ -385,6 +450,48 @@ def test_retryable_errors_detected(message):
 @pytest.mark.parametrize("message", ["400 Invalid argument", "401 Unauthorized"])
 def test_non_retryable_errors_detected(message):
     assert not _is_retryable(Exception(message))
+
+
+def test_daily_quota_marker_detected():
+    exc = RuntimeError(
+        "429 RESOURCE_EXHAUSTED. quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+    )
+    assert _is_daily_quota_exhausted(exc)
+
+
+def test_daily_quota_marker_not_confused_with_per_minute_limit():
+    exc = RuntimeError("429 RESOURCE_EXHAUSTED: rate limit exceeded, retry in 2s")
+    assert not _is_daily_quota_exhausted(exc)
+
+
+def test_client_fails_fast_on_daily_quota(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    class FakeModels:
+        calls = 0
+
+        def generate_content(self, model, contents, config):
+            FakeModels.calls += 1
+            raise RuntimeError(
+                "429 RESOURCE_EXHAUSTED. quotaId: "
+                "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+            )
+
+    client = GeminiClient.__new__(GeminiClient)
+    client.api_key = "test-key"
+    client.model = "gemini-3.7-flash"
+    client.config = RateLimitConfig(requests_per_minute=0, max_retries=4, base_backoff_seconds=0)
+    slept: list[float] = []
+    client._sleep = slept.append
+    from scanner.core import RateLimiter
+
+    client._limiter = RateLimiter(0, sleep=lambda _s: None)
+    client._client = type("C", (), {"models": FakeModels()})()
+
+    with pytest.raises(DailyQuotaExceededError):
+        client.generate("sys", "user")
+    assert FakeModels.calls == 1, "must not retry a daily-quota error"
+    assert slept == [], "must not sleep/backoff on a daily-quota error"
 
 
 def test_client_retries_then_succeeds(monkeypatch):
@@ -479,6 +586,16 @@ def test_render_markdown_clean_scan(tmp_path: Path):
     (tmp_path / "safe.py").write_text("x = 1\n")
     report = Scanner(FakeClient(json.dumps({"vulnerabilities": []}))).scan(tmp_path)
     assert "No vulnerabilities found" in render_markdown(report)
+
+
+def test_render_markdown_includes_truncation_warning():
+    report = ScanReport(
+        truncated=True,
+        truncation_reason="Stopped after 1 of 3 files (2 not attempted): boom",
+    )
+    md = render_markdown(report)
+    assert "Scan incomplete" in md
+    assert "Stopped after 1 of 3" in md
 
 
 def test_write_report_json_and_markdown(tmp_path: Path):
@@ -653,3 +770,25 @@ def test_cli_writes_output_file(tmp_path: Path, monkeypatch):
 
     CliRunner().invoke(cli_module.main, ["--target", str(src), "--output", str(out)])
     assert json.loads(out.read_text())["summary"]["total_findings"] == 1
+
+
+def test_cli_exits_2_when_truncated_even_with_findings(tmp_path: Path, monkeypatch):
+    """An incomplete scan must never look like a passing (0) or even a normal
+    failing (1) run — CI should treat it as untrustworthy, not as a clean bill
+    of health for the files it never got to."""
+    from click.testing import CliRunner
+
+    from scanner import cli as cli_module
+
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "b.py").write_text("y = 2\n")
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    client = QuotaExhaustedClient(
+        responses=[json.dumps({"vulnerabilities": [_finding(severity="CRITICAL")]})],
+        fail_after=1,
+    )
+    monkeypatch.setattr(cli_module, "GeminiClient", lambda **kw: client)
+
+    result = CliRunner().invoke(cli_module.main, ["--target", str(tmp_path)])
+    assert result.exit_code == 2

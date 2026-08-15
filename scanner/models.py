@@ -154,6 +154,11 @@ class ScanReport(BaseModel):
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     summary: ScanSummary = Field(default_factory=ScanSummary)
     results: list[FileScanResult] = Field(default_factory=list)
+    truncated: bool = Field(
+        default=False,
+        description="True if the scan stopped early (e.g. daily API quota exhaustion) before covering every discovered file.",
+    )
+    truncation_reason: str | None = None
 
     @property
     def findings(self) -> list[Vulnerability]:

@@ -149,8 +149,17 @@ Retryability is decided by substring matching on the stringified exception (`_is
 | Bad `--output` extension | Validated before any API call | `2` |
 | Unreadable/binary/oversized file | Recorded in `FileScanResult.error`, scan continues | unaffected |
 | Malformed LLM response for one chunk | Recorded per-file, other chunks continue | unaffected |
+| Daily API quota exhausted mid-scan | `DailyQuotaExceededError`, scan stops immediately, remaining files marked skipped | `2`, always — overrides findings |
 
 The `--output` extension is checked **before** the client is constructed, so a typo in the filename does not waste an entire scan's worth of API quota.
+
+### 4.7a Daily quota exhaustion is not a per-file error
+
+A quota error looks, on the wire, exactly like the transient errors `_is_retryable()` already handles: a `429` with a short suggested `retryDelay`. But Google's daily-quota errors carry a `quotaId` naming a `PerDay` metric, and no amount of short-delay retrying clears a daily cap — so treating it as retryable means every remaining file in the scan retries, waits out the backoff, and fails anyway, one at a time. On a real run this is not just slow: it produces a wall of near-identical 429 dumps in the failed-files list that bury whatever real error info the report contains.
+
+`_is_daily_quota_exhausted()` detects the `PerDay` marker specifically and raises `DailyQuotaExceededError` immediately, bypassing the retry loop in `GeminiClient.generate()` entirely. `Scanner.scan_file()` lets it propagate rather than folding it into the per-chunk `errors` list like a normal `ScannerError`, and `Scanner.scan()` catches it once, marks every remaining discovered file as skipped with a single shared reason, and stops — no wasted requests, no repeated backoff, one clear message instead of N.
+
+The exit-code decision follows from a stricter principle: **an incomplete scan must never be indistinguishable from a clean or a normal-fail one.** `ScanReport.truncated` is checked before the ordinary findings-based exit logic in `cli.main()` and forces exit `2` unconditionally — even if every file scanned before the wall had CRITICAL findings. The alternative (exit `1`, since findings exist) would let CI treat a scan that silently skipped half the repository as an ordinary "found problems, fix them" result, which is a worse failure mode than the tool visibly breaking.
 
 ### 4.8 Model selection and pinning
 

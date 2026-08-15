@@ -138,12 +138,21 @@ Tested against three real external codebases, not the vulnerable fixtures:
 
 **Open item**: the tuned prompt has *not yet* been validated against `gemini-3.7-flash` — the actual default/production model — because its free-tier daily quota (20 req/day) was already exhausted by the time the fix was ready to test. `gemini-3.7-flash` is the model that matters for this question, since it already showed clean judgment on this exact file under the *old* prompt. Re-test once quota resets.
 
+### 2g. Fail fast on daily quota exhaustion ✅
+
+The gap 2f surfaced in itself, fixed: once Google's free-tier *daily* request quota is exhausted, it was previously indistinguishable at the code level from a transient rate limit, so the scanner retried with backoff and then failed on **every remaining file individually** — a wall of near-duplicate 429 dumps burying the actual report, and real wall-clock time wasted retrying something that can't succeed until the quota resets.
+
+- `_is_daily_quota_exhausted()` detects the `PerDay` marker in Google's `quotaId` and raises the new `DailyQuotaExceededError` immediately in `GeminiClient.generate()`, bypassing the retry loop entirely.
+- `Scanner.scan_file()` lets it propagate instead of folding it into the per-chunk error list; `Scanner.scan()` catches it once, marks every remaining discovered file as skipped with a single shared reason, and stops.
+- `ScanReport.truncated` / `truncation_reason` surface this in all three output formats (a warning line in the terminal, a blockquote near the top of the Markdown report, and the fields themselves in JSON).
+- **Exit code is forced to `2` whenever a scan is truncated, unconditionally** — even if the files that did complete had CRITICAL findings. An incomplete scan must never be indistinguishable from a normal pass/fail result; CI should treat "the tool didn't finish" as its own failure mode, not quietly fold it into "found problems."
+- Covered by 8 new tests (marker detection, no-retry-on-daily-quota, propagation through `scan_file`, stop-early + skip-marking in `scan`, the forced exit code, and the Markdown warning). 64/64 tests passing.
+
 ### Remaining in Phase 2
 
 - Validate the tuned prompt against `gemini-3.7-flash` once quota resets (see 2f above).
 - Add a `--baseline` file to suppress accepted risks.
 - Add SARIF output for GitHub Code Scanning.
-- Fix a real gap the quota wall surfaced: once a *daily* quota is exhausted, the scanner currently retries and fails on every remaining file individually, each producing a near-duplicate wall of 429 text in the failed-files list. It should detect daily-quota exhaustion specifically (distinct from a transient rate limit) and fail the whole run fast with one message instead.
 
 ---
 
