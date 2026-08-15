@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
 from scanner.core import (
     DailyQuotaExceededError,
@@ -28,12 +29,21 @@ from scanner.file_handler import (
     read_source_file,
     SourceFile,
 )
+from scanner.baseline import (
+    Baseline,
+    BaselineEntry,
+    apply_baseline,
+    load_baseline,
+    save_baseline,
+)
+from scanner.baseline import update_baseline as merge_baseline
 from scanner.models import FileScanResult, ScanReport, Severity, Vulnerability
 from scanner.reporter import (
     _parse_line_region,
     render_json,
     render_markdown,
     render_sarif,
+    render_terminal,
     write_report,
 )
 
@@ -699,6 +709,190 @@ def test_write_report_rejects_unknown_format(tmp_path: Path):
         write_report(report, tmp_path / "report.txt")
 
 
+def test_render_terminal_hides_suppressed_finding_detail():
+    report = ScanReport()
+    v = Vulnerability.model_validate(_finding())
+    v.suppressed = True
+    report.results = [FileScanResult(file_path="a.py", vulnerabilities=[v])]
+    report.rebuild_summary()
+
+    console = Console(record=True, width=120)
+    render_terminal(report, console=console)
+    output = console.export_text()
+
+    assert "suppressed by baseline" in output
+    assert "SQL Injection via Direct Parameter Concatenation" not in output
+
+
+# --------------------------------------------------------------------------
+# baseline
+# --------------------------------------------------------------------------
+
+
+def _vuln(cwe: str = "CWE-89", file_path: str = "a.py", line: str = "18-20", title: str = "SQLi") -> Vulnerability:
+    data = _finding(line=line)
+    data["cwe_id"] = cwe
+    data["file_path"] = file_path
+    data["title"] = title
+    return Vulnerability.model_validate(data)
+
+
+def test_load_baseline_missing_file_is_empty(tmp_path: Path):
+    baseline = load_baseline(tmp_path / "nonexistent.json")
+    assert baseline.entries == []
+
+
+def test_save_and_load_baseline_roundtrip(tmp_path: Path):
+    path = tmp_path / "baseline.json"
+    original = Baseline(
+        entries=[BaselineEntry(file_path="a.py", cwe_id="CWE-89", line_start=18, line_end=20)]
+    )
+    save_baseline(original, path)
+    loaded = load_baseline(path)
+    assert loaded.entries[0].file_path == "a.py"
+    assert loaded.entries[0].cwe_id == "CWE-89"
+
+
+def test_apply_baseline_suppresses_exact_match():
+    baseline = Baseline(
+        entries=[BaselineEntry(file_path="a.py", cwe_id="CWE-89", line_start=18, line_end=20)]
+    )
+    report = ScanReport(results=[FileScanResult(file_path="a.py", vulnerabilities=[_vuln()])])
+
+    suppressed_count = apply_baseline(report, baseline)
+    report.rebuild_summary()
+
+    assert suppressed_count == 1
+    assert report.findings[0].suppressed is True
+    assert report.summary.total_findings == 0
+    assert report.summary.suppressed_findings == 1
+    assert report.has_actionable_findings is False
+
+
+def test_apply_baseline_matches_despite_reworded_title():
+    """The whole point: a baseline must keep suppressing a finding even if
+    the model reworded its title on a later run, as observed in practice."""
+    baseline = Baseline(
+        entries=[
+            BaselineEntry(
+                file_path="a.py",
+                cwe_id="CWE-89",
+                line_start=18,
+                line_end=20,
+                title_at_acceptance="Original title from first run",
+            )
+        ]
+    )
+    reworded = _vuln(title="A completely different way of describing the same bug")
+    report = ScanReport(results=[FileScanResult(file_path="a.py", vulnerabilities=[reworded])])
+
+    apply_baseline(report, baseline)
+    assert report.findings[0].suppressed is True
+
+
+@pytest.mark.parametrize("line", ["18-20", "16-17", "21-22", "18", "20,21"])
+def test_apply_baseline_tolerates_small_line_drift(line):
+    baseline = Baseline(
+        entries=[BaselineEntry(file_path="a.py", cwe_id="CWE-89", line_start=18, line_end=20)]
+    )
+    report = ScanReport(
+        results=[FileScanResult(file_path="a.py", vulnerabilities=[_vuln(line=line)])]
+    )
+    apply_baseline(report, baseline)
+    assert report.findings[0].suppressed is True, f"line={line!r} should be within tolerance"
+
+
+def test_apply_baseline_does_not_match_far_away_line():
+    baseline = Baseline(
+        entries=[BaselineEntry(file_path="a.py", cwe_id="CWE-89", line_start=18, line_end=20)]
+    )
+    report = ScanReport(
+        results=[FileScanResult(file_path="a.py", vulnerabilities=[_vuln(line="200-205")])]
+    )
+    apply_baseline(report, baseline)
+    assert report.findings[0].suppressed is False
+
+
+def test_apply_baseline_requires_matching_cwe():
+    baseline = Baseline(
+        entries=[BaselineEntry(file_path="a.py", cwe_id="CWE-89", line_start=18, line_end=20)]
+    )
+    report = ScanReport(
+        results=[FileScanResult(file_path="a.py", vulnerabilities=[_vuln(cwe="CWE-798")])]
+    )
+    apply_baseline(report, baseline)
+    assert report.findings[0].suppressed is False
+
+
+def test_apply_baseline_requires_matching_file():
+    baseline = Baseline(
+        entries=[BaselineEntry(file_path="a.py", cwe_id="CWE-89", line_start=18, line_end=20)]
+    )
+    report = ScanReport(
+        results=[FileScanResult(file_path="b.py", vulnerabilities=[_vuln(file_path="b.py")])]
+    )
+    apply_baseline(report, baseline)
+    assert report.findings[0].suppressed is False
+
+
+def test_update_baseline_adds_new_entries():
+    result = merge_baseline(Baseline(), [_vuln()])
+    assert len(result.entries) == 1
+    assert result.entries[0].file_path == "a.py"
+    assert result.entries[0].cwe_id == "CWE-89"
+    assert result.entries[0].line_start == 18
+    assert result.entries[0].line_end == 20
+
+
+def test_update_baseline_is_idempotent():
+    once = merge_baseline(Baseline(), [_vuln()])
+    twice = merge_baseline(once, [_vuln()])
+    assert len(twice.entries) == 1  # re-running against unchanged code doesn't grow the file
+
+
+def test_update_baseline_preserves_existing_entries():
+    existing = Baseline(
+        entries=[BaselineEntry(file_path="old.py", cwe_id="CWE-798", line_start=1, line_end=2)]
+    )
+    result = merge_baseline(existing, [_vuln()])
+    assert len(result.entries) == 2
+
+
+def test_render_markdown_separates_suppressed_findings():
+    active = _vuln(title="Still open")
+    suppressed = _vuln(cwe="CWE-798", title="Accepted risk")
+    suppressed.suppressed = True
+    report = ScanReport(
+        results=[FileScanResult(file_path="a.py", vulnerabilities=[active, suppressed])]
+    )
+    report.rebuild_summary()
+
+    md = render_markdown(report)
+    assert "## Suppressed by Baseline" in md
+    assert "Accepted risk" in md
+    assert "Still open" in md
+    # Suppressed findings appear only in the compact list, not with full patch detail.
+    assert md.count("**Secure replacement**") == 1
+
+
+def test_render_sarif_marks_suppressed_results():
+    active = _vuln(title="Still open")
+    suppressed = _vuln(cwe="CWE-798", title="Accepted risk")
+    suppressed.suppressed = True
+    report = ScanReport(
+        results=[FileScanResult(file_path="a.py", vulnerabilities=[active, suppressed])]
+    )
+
+    sarif = json.loads(render_sarif(report))
+    suppressed_result = next(
+        r for r in sarif["runs"][0]["results"] if r["ruleId"] == "CWE-798"
+    )
+    active_result = next(r for r in sarif["runs"][0]["results"] if r["ruleId"] == "CWE-89")
+
+    assert "suppressions" in suppressed_result
+    assert "suppressions" not in active_result
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -879,6 +1073,114 @@ def test_cli_writes_sarif_output(tmp_path: Path, monkeypatch):
     assert data["version"] == "2.1.0"
     assert data["runs"][0]["results"][0]["ruleId"] == "CWE-89"
     assert result.exit_code == 1  # findings still gate the build normally
+
+
+def test_cli_update_baseline_requires_baseline_flag(tmp_path: Path, monkeypatch):
+    from click.testing import CliRunner
+
+    from scanner import cli as cli_module
+
+    (tmp_path / "a.py").write_text("x = 1\n")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    result = CliRunner().invoke(
+        cli_module.main, ["--target", str(tmp_path), "--update-baseline"]
+    )
+    assert result.exit_code == 2
+
+
+def test_cli_update_baseline_creates_file_and_exits_clean(tmp_path: Path, monkeypatch):
+    from click.testing import CliRunner
+
+    from scanner import cli as cli_module
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.py").write_text("x = 1\n")
+    baseline_path = tmp_path / "baseline.json"
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        cli_module,
+        "GeminiClient",
+        lambda **kw: FakeClient(json.dumps({"vulnerabilities": [_finding(severity="CRITICAL")]})),
+    )
+
+    result = CliRunner().invoke(
+        cli_module.main,
+        ["--target", str(src), "--baseline", str(baseline_path), "--update-baseline"],
+    )
+    assert result.exit_code == 0  # accepting current state must not fail the build
+    assert baseline_path.exists()
+    saved = json.loads(baseline_path.read_text())
+    assert len(saved["entries"]) == 1
+    assert saved["entries"][0]["cwe_id"] == "CWE-89"
+
+
+def test_cli_baseline_suppresses_previously_accepted_finding(tmp_path: Path, monkeypatch):
+    """The end-to-end workflow: --update-baseline once, then --baseline on a
+    later run with the same finding (even reworded) exits clean."""
+    from click.testing import CliRunner
+
+    from scanner import cli as cli_module
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.py").write_text("x = 1\n")
+    baseline_path = tmp_path / "baseline.json"
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        cli_module,
+        "GeminiClient",
+        lambda **kw: FakeClient(json.dumps({"vulnerabilities": [_finding(severity="CRITICAL")]})),
+    )
+    CliRunner().invoke(
+        cli_module.main,
+        ["--target", str(src), "--baseline", str(baseline_path), "--update-baseline"],
+    )
+
+    reworded = _finding(severity="CRITICAL")
+    reworded["title"] = "A totally reworded description of the same bug"
+    monkeypatch.setattr(
+        cli_module,
+        "GeminiClient",
+        lambda **kw: FakeClient(json.dumps({"vulnerabilities": [reworded]})),
+    )
+    result = CliRunner().invoke(
+        cli_module.main, ["--target", str(src), "--baseline", str(baseline_path)]
+    )
+    assert result.exit_code == 0
+
+
+def test_cli_baseline_still_fails_on_genuinely_new_finding(tmp_path: Path, monkeypatch):
+    from click.testing import CliRunner
+
+    from scanner import cli as cli_module
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.py").write_text("x = 1\n")
+    baseline_path = tmp_path / "baseline.json"
+    save_baseline(
+        Baseline(
+            entries=[
+                BaselineEntry(file_path="a.py", cwe_id="CWE-798", line_start=1, line_end=2)
+            ]
+        ),
+        baseline_path,
+    )
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        cli_module,
+        "GeminiClient",
+        lambda **kw: FakeClient(json.dumps({"vulnerabilities": [_finding(severity="CRITICAL")]})),
+    )
+    result = CliRunner().invoke(
+        cli_module.main, ["--target", str(src), "--baseline", str(baseline_path)]
+    )
+    assert result.exit_code == 1  # different CWE at a different line: not the accepted finding
 
 
 def test_cli_exits_2_when_truncated_even_with_findings(tmp_path: Path, monkeypatch):

@@ -104,6 +104,24 @@ llm-appsec-scanner -t ./terraform -o security-report.md
 | `--chunk-lines` | auto | Lines per request for large files |
 | `--quiet`, `-q` | off | Summary table only |
 | `--no-fail` | off | Always exit `0` (report-only mode) |
+| `--baseline PATH` | — | Suppress findings already accepted in this baseline file |
+| `--update-baseline` | off | Fold every current finding into `--baseline` instead of suppressing; always exits `0` |
+
+### Accepting risk with `--baseline`
+
+Adopting the scanner on an existing codebase usually means an initial wave of findings you've reviewed and consciously decided not to fix right now. A baseline stops those from re-failing the build on every subsequent run, without hiding them from the report entirely.
+
+```bash
+# First run: accept everything currently found.
+llm-appsec-scanner -t ./src --baseline .appsec-baseline.json --update-baseline
+
+# Every run after that: only genuinely new findings fail the build.
+llm-appsec-scanner -t ./src --baseline .appsec-baseline.json
+```
+
+A baseline entry matches on **file path and CWE id exactly, plus a small tolerance on line number** — deliberately *not* on the finding's title or wording. In practice the same underlying issue can come back reworded between runs on a non-deterministic model; matching on wording would mean the baseline silently stops working the moment the model phrases something differently. Matched findings still appear in the report under a separate "Suppressed by Baseline" section (and in SARIF as a dismissed `suppressions` entry) — a baseline hides a finding from the *exit code*, never from the record.
+
+Re-run with `--update-baseline` any time you've reviewed and want to accept new findings; it's additive and idempotent, so re-running it against unchanged code doesn't grow the file.
 
 ---
 
@@ -250,7 +268,7 @@ jobs:
           path: security-report.md
 ```
 
-The job fails when a HIGH or CRITICAL finding is present. Add `--no-fail` while you are baselining an existing codebase.
+The job fails when a HIGH or CRITICAL finding is present. Adopting this on an existing codebase? Use [`--baseline`](#accepting-risk-with---baseline) to accept what's already there instead of reaching for `--no-fail` — that way new findings still fail the build.
 
 ### GitHub Code Scanning (SARIF)
 
@@ -333,8 +351,8 @@ pytest -q -k reporter          # one area
 ## Roadmap
 
 - [ ] Cross-file taint analysis with a repository-level context pass
-- [ ] SARIF output for GitHub Code Scanning
-- [ ] Baseline/suppression file to ignore accepted risks
+- [x] SARIF output for GitHub Code Scanning
+- [x] Baseline/suppression file to ignore accepted risks
 - [ ] Concurrent file scanning with a shared rate limiter
 - [ ] Auto-fix mode that applies `code_patch` as a git diff
 

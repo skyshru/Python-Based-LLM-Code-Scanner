@@ -159,10 +159,21 @@ A fourth `reporter.py` format — [SARIF 2.1.0](https://sarifweb.azurewebsites.n
 - `write_report()` and the CLI's `--output` validation both accept `.sarif` and `.sarif.json`; a GitHub Actions example using `github/codeql-action/upload-sarif` was added to the README.
 - Full design rationale in [DESIGN.md §4.10](DESIGN.md#410-sarif-output). Covered by 11 new tests (region parsing across malformed inputs, rule deduplication, severity mapping, truncation reflection, both output extensions, and CLI end-to-end). 75/75 tests passing.
 
+**Re-checked the `gemini-3.7-flash` quota before starting this item** (a single-file probe) — still exhausted, and the daily-quota fail-fast fix from 2g confirmed itself working correctly in the process: one clean attempt, one clear message, immediate exit `2`, instead of yesterday's wall of repeated retries. Prompt validation against the default model remains open.
+
+### 2i. `--baseline` suppression file ✅
+
+New module `scanner/baseline.py`. Designed deliberately, not reused from SARIF's fingerprint — the two problems look similar but aren't the same problem, and 2f's own data ruled out the obvious naive approach before any code was written.
+
+- **Match rule, grounded in observed behavior, not theory:** exact match on `file_path` and `cwe_id`, fuzzy match on line range (overlap or within `LINE_TOLERANCE = 3` lines). Title is never matched on. This is a direct response to 2f: the same underlying issue came back reworded and with a different finding count between two runs of the same model on the same file, while `cwe_id` stayed exactly stable — so matching on wording, the way the SARIF fingerprint does, would have meant the baseline silently stopping working the moment the model rephrased something.
+- **Workflow:** `--baseline PATH --update-baseline` accepts everything currently found (creating the file if needed); `--baseline PATH` alone suppresses matches on later runs. Both use the same underlying `update_baseline()`/`apply_baseline()` matching logic, so `--update-baseline` is additive and idempotent by construction — re-running it against unchanged code never grows the file, because it checks each finding against existing entries with the same tolerance before appending, not a separate dedup pass.
+- **Suppressed, not deleted:** `Vulnerability.suppressed` marks a finding in place rather than removing it from the report. `ScanReport.active_findings` (new) — everything except suppressed — is what now drives `summary.total_findings`, the severity table, and the exit code; `ScanReport.findings` (existing) still returns everything, so JSON stays a complete audit trail. Zero behavior change when `--baseline` isn't used.
+- Markdown and terminal output list suppressed findings in a separate, compact section (file, line, title, CWE — no patch detail) rather than hiding them; SARIF marks them with a native `suppressions` entry so GitHub Code Scanning shows them as dismissed rather than open.
+- Full design rationale, including the explicit tradeoff being made (false negatives on genuinely new-but-nearby findings, traded for not re-flagging accepted findings on every run) in [DESIGN.md §4.11](DESIGN.md#411-baseline-suppression). Covered by 22 new tests (matching rules, idempotency, reworded-title resilience, both CLI flags end-to-end). 97/97 tests passing.
+
 ### Remaining in Phase 2
 
-- Validate the tuned prompt against `gemini-3.7-flash` once quota resets (see 2f above).
-- Add a `--baseline` file to suppress accepted risks — now informed by 2h's fingerprinting groundwork, but still needs its own design pass for cross-run matching under model non-determinism.
+- Validate the tuned prompt against `gemini-3.7-flash` once quota resets (see 2f above) — the only item left, and it's blocked on Google's schedule rather than anything in our control.
 
 ---
 

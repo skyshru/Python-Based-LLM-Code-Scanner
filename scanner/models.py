@@ -84,6 +84,10 @@ class Vulnerability(BaseModel):
     remediation: str
     code_patch: CodePatch
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    suppressed: bool = Field(
+        default=False,
+        description="True if this finding matched a --baseline entry and is treated as accepted risk.",
+    )
 
     @field_validator("line_number_range", mode="before")
     @classmethod
@@ -139,6 +143,10 @@ class ScanSummary(BaseModel):
     files_failed: int = 0
     total_findings: int = 0
     findings_by_severity: dict[str, int] = Field(default_factory=dict)
+    suppressed_findings: int = Field(
+        default=0,
+        description="Findings that matched a --baseline entry, excluded from total_findings.",
+    )
 
 
 class ScanReport(BaseModel):
@@ -162,16 +170,26 @@ class ScanReport(BaseModel):
 
     @property
     def findings(self) -> list[Vulnerability]:
+        """Every finding, including those suppressed by a baseline. Kept
+        unfiltered so JSON output stays a complete, auditable record even
+        when --baseline is in play."""
         return [v for r in self.results for v in r.vulnerabilities]
+
+    @property
+    def active_findings(self) -> list[Vulnerability]:
+        """Findings that count toward the report's severity summary and exit
+        code -- everything except what a baseline has marked as accepted."""
+        return [f for f in self.findings if not f.suppressed]
 
     @property
     def has_actionable_findings(self) -> bool:
         return self.summary.total_findings > 0
 
     def rebuild_summary(self, files_discovered: int | None = None) -> None:
-        findings = self.findings
+        active = self.active_findings
+        suppressed_count = len(self.findings) - len(active)
         by_severity: dict[str, int] = {s.value: 0 for s in Severity}
-        for finding in findings:
+        for finding in active:
             by_severity[finding.severity.value] += 1
         self.summary = ScanSummary(
             files_discovered=(
@@ -181,6 +199,7 @@ class ScanReport(BaseModel):
             ),
             files_scanned=sum(1 for r in self.results if r.scanned and not r.error),
             files_failed=sum(1 for r in self.results if r.error),
-            total_findings=len(findings),
+            total_findings=len(active),
             findings_by_severity=by_severity,
+            suppressed_findings=suppressed_count,
         )

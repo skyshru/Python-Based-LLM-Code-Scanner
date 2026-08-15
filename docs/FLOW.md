@@ -10,6 +10,7 @@ A module-by-module walkthrough of what was built, why, and how the pieces fit to
 - [Module 3 — File Discovery & Chunking](#module-3--file-discovery--chunking)
 - [Module 4 — The LLM Core](#module-4--the-llm-core)
 - [Module 5 — Reporting](#module-5--reporting)
+- [Module 5a — Baseline Suppression](#module-5a--baseline-suppression)
 - [Module 6 — The CLI](#module-6--the-cli)
 - [Module 7 — Testing](#module-7--testing)
 - [Module 8 — End-to-End Trace](#module-8--end-to-end-trace)
@@ -49,9 +50,10 @@ llm-appsec-scanner/
 │   ├── core.py            LLM orchestration
 │   ├── models.py          Pydantic schemas
 │   ├── file_handler.py    traversal, filtering, chunking
-│   └── reporter.py        JSON / Markdown / SARIF / terminal
+│   ├── reporter.py        JSON / Markdown / SARIF / terminal
+│   └── baseline.py        cross-run suppression of accepted findings
 ├── tests/
-│   ├── test_scanner.py    75 tests, no network
+│   ├── test_scanner.py    97 tests, no network
 │   └── vulnerable_samples/
 ├── docs/
 │   ├── DESIGN.md          architecture and rationale
@@ -156,7 +158,7 @@ def has_actionable_findings(self) -> bool:
     return self.summary.total_findings > 0
 ```
 
-Because threshold filtering already happened in `Scanner.scan_file()`, anything left in the report is by definition actionable. The CLI's exit code is one property read.
+Threshold filtering already happened in `Scanner.scan_file()`, and baseline suppression (Module 5a) marks rather than removes, so `total_findings` counts `active_findings` — everything in the report *except* what a baseline accepted — not literally everything present. `findings` (all of it, suppressed included) stays available for a complete, auditable JSON record; `active_findings` is what the exit code and severity table actually read. The CLI's exit-code check is still one property read either way.
 
 ---
 
@@ -316,6 +318,33 @@ Four renderers over the same `ScanReport`. Each is a pure function of the report
 
 ---
 
+## Module 5a — Baseline Suppression
+
+**File:** [`scanner/baseline.py`](../scanner/baseline.py)
+
+A small, self-contained module with two Pydantic models and four functions — deliberately kept separate from `reporter.py` (it decides *which* findings count, not how to render them) and from `models.py` (it's policy over the data model, not the data model itself).
+
+```
+Baseline                     the whole file: version + list[BaselineEntry]
+├── BaselineEntry            file_path, cwe_id, line_start, line_end, accepted_at, title_at_acceptance
+
+load_baseline(path)          missing file → empty Baseline, not an error
+save_baseline(baseline, path)
+
+apply_baseline(report, baseline)     marks matching findings .suppressed = True, in place
+update_baseline(existing, findings)  folds current findings into a Baseline, additively
+```
+
+**The match rule, precisely:** `file_path` and `cwe_id` exact, line range fuzzy (overlap or within `LINE_TOLERANCE = 3` lines). `title_at_acceptance` is stored for a human to read later but is never compared. See [DESIGN.md §4.11](DESIGN.md#411-baseline-suppression) for why — short version: real testing showed `cwe_id` stays stable across runs of a non-deterministic model while titles and finding counts don't, so matching on title would make the baseline silently stop working.
+
+**`update_baseline()` is where the idempotency lives.** It checks each incoming finding against *existing* entries with the same tolerance-based comparison `apply_baseline()` uses, before appending — so running `--update-baseline` twice against unchanged code produces an identical file, not a growing one. This isn't a separate dedup step; it's the same matching logic reused, which is what keeps "what got written" and "what will later match" from drifting apart.
+
+**Suppression is a mark, not a deletion.** `apply_baseline()` sets `Vulnerability.suppressed = True` on the `ScanReport` in place and returns a count; it does not remove anything from `FileScanResult.vulnerabilities`. This is what lets `render_json()` stay a complete record while `ScanReport.active_findings` (added alongside this feature) filters suppressed findings out for everything that drives the exit code.
+
+**CLI wiring** (`scanner/cli.py`): `--update-baseline` requires `--baseline PATH` — validated up front, before the client is constructed, consistent with the existing `--output` extension check. When updating, every current finding is also marked suppressed on the in-memory report before rendering, so the run's own terminal/file output shows "0 outstanding" immediately rather than listing findings right after just accepting them, and `no_fail` is forced on since accepting the current state was the point of the run, not gating on it.
+
+---
+
 ## Module 6 — The CLI
 
 **File:** [`scanner/cli.py`](../scanner/cli.py)
@@ -356,7 +385,7 @@ The `2`-vs-`1` split matters in CI: a pipeline can distinguish "the scanner foun
 
 ## Module 7 — Testing
 
-**File:** [`tests/test_scanner.py`](../tests/test_scanner.py) — 75 tests, no network, no API key.
+**File:** [`tests/test_scanner.py`](../tests/test_scanner.py) — 97 tests, no network, no API key.
 
 ### The `FakeClient`
 
@@ -509,3 +538,6 @@ for m in client.models.list():
 | Exit `2` immediately | Missing key, bad target, bad `--output` extension, or a truncated (quota-exhausted) scan | Read the stderr message — a truncated scan always exits `2`, even if findings exist in the files that did complete |
 | Scan is slow | Serial requests + RPM pacing | Narrow `--target`; concurrency is on the roadmap |
 | Line numbers look wrong | Reporting bug on a chunked file | Confirm the file is >400 lines; check `number_lines` offsets |
+| `error: --update-baseline requires --baseline PATH` | Passed `--update-baseline` alone | Add `--baseline PATH`; the two flags always go together |
+| A finding that should be new got silently suppressed | Baseline's fuzzy line-range tolerance (`LINE_TOLERANCE = 3`) matched a *different* finding of the same CWE nearby | Known, accepted tradeoff — see [DESIGN.md §4.11](DESIGN.md#411-baseline-suppression). Remove the offending entry from the baseline file by hand if it's too coarse for that spot |
+| A finding you expected to be suppressed still fails the build | `file_path` or `cwe_id` didn't match exactly (baseline never matches on title) | Confirm the baseline entry's `file_path`/`cwe_id` against the new finding; re-run `--update-baseline` to accept it if it's genuinely the same issue |

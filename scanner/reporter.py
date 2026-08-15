@@ -88,6 +88,10 @@ def render_markdown(report: ScanReport) -> str:
         f"| Files scanned | {summary.files_scanned} |",
         f"| Files failed | {summary.files_failed} |",
         f"| Total findings | {summary.total_findings} |",
+    ]
+    if summary.suppressed_findings:
+        lines.append(f"| Suppressed by baseline | {summary.suppressed_findings} |")
+    lines += [
         "",
         "| Severity | Count |",
         "| --- | --- |",
@@ -97,16 +101,27 @@ def render_markdown(report: ScanReport) -> str:
 
     lines += ["", "## Findings", ""]
 
-    findings = report.findings
-    if not findings:
+    active_findings = report.active_findings
+    if not active_findings:
         lines.append("No vulnerabilities found at or above the configured threshold.")
     else:
         for result in report.results:
-            if not result.vulnerabilities:
+            active_in_file = [v for v in result.vulnerabilities if not v.suppressed]
+            if not active_in_file:
                 continue
             lines += [f"### `{result.file_path}`", ""]
-            for finding in result.vulnerabilities:
+            for finding in active_in_file:
                 lines += _markdown_finding(finding, result.language)
+
+    suppressed = [v for r in report.results for v in r.vulnerabilities if v.suppressed]
+    if suppressed:
+        lines += ["## Suppressed by Baseline", ""]
+        for finding in suppressed:
+            lines.append(
+                f"- `{finding.file_path}:{finding.line_number_range}` — "
+                f"{finding.title} ({finding.cwe_id})"
+            )
+        lines.append("")
 
     failed = [r for r in report.results if r.error]
     if failed:
@@ -188,22 +203,27 @@ def render_sarif(report: ScanReport, indent: int = 2) -> str:
         if region:
             physical_location["region"] = region
 
-        results.append(
-            {
-                "ruleId": finding.cwe_id,
-                "ruleIndex": rule_index[finding.cwe_id],
-                "level": SARIF_LEVEL[finding.severity],
-                "message": {"text": f"{finding.description}\n\nRemediation: {finding.remediation}"},
-                "locations": [{"physicalLocation": physical_location}],
-                "partialFingerprints": {
-                    "llmAppsecScannerFingerprint/v1": _finding_fingerprint(finding),
-                },
-                "properties": {
-                    "severity": finding.severity.value,
-                    "vulnerabilityId": finding.vulnerability_id,
-                },
-            }
-        )
+        result: dict = {
+            "ruleId": finding.cwe_id,
+            "ruleIndex": rule_index[finding.cwe_id],
+            "level": SARIF_LEVEL[finding.severity],
+            "message": {"text": f"{finding.description}\n\nRemediation: {finding.remediation}"},
+            "locations": [{"physicalLocation": physical_location}],
+            "partialFingerprints": {
+                "llmAppsecScannerFingerprint/v1": _finding_fingerprint(finding),
+            },
+            "properties": {
+                "severity": finding.severity.value,
+                "vulnerabilityId": finding.vulnerability_id,
+            },
+        }
+        if finding.suppressed:
+            # GitHub Code Scanning understands this natively and shows the
+            # result as dismissed rather than as an open alert.
+            result["suppressions"] = [
+                {"kind": "external", "justification": "Accepted via --baseline"}
+            ]
+        results.append(result)
 
     # A truncated (quota-exhausted) scan must not look like a completed,
     # clean run to GitHub Code Scanning either -- same principle as the exit
@@ -294,10 +314,15 @@ def render_terminal(report: ScanReport, console: Console | None = None, verbose:
         )
     console.print(table)
 
+    suppressed_note = (
+        f", {report.summary.suppressed_findings} suppressed by baseline"
+        if report.summary.suppressed_findings
+        else ""
+    )
     console.print(
         f"[dim]{report.summary.files_scanned} scanned, "
         f"{report.summary.files_failed} failed, "
-        f"{report.summary.total_findings} findings "
+        f"{report.summary.total_findings} findings{suppressed_note} "
         f"(threshold {report.severity_threshold.value})[/dim]"
     )
 
@@ -306,7 +331,8 @@ def render_terminal(report: ScanReport, console: Console | None = None, verbose:
 
     for result in report.results:
         for finding in result.vulnerabilities:
-            _print_finding(console, finding, result.language)
+            if not finding.suppressed:
+                _print_finding(console, finding, result.language)
 
     for result in report.results:
         if result.error:

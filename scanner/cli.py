@@ -10,6 +10,8 @@ import click
 from dotenv import load_dotenv
 from rich.console import Console
 
+from .baseline import apply_baseline, load_baseline, save_baseline
+from .baseline import update_baseline as merge_baseline
 from .core import (
     DEFAULT_MODEL,
     GeminiClient,
@@ -97,6 +99,21 @@ def _has_supported_output_extension(path: Path) -> bool:
     is_flag=True,
     help="Always exit 0, even when findings exist.",
 )
+@click.option(
+    "--baseline",
+    "baseline_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Suppress findings already accepted in this baseline file.",
+)
+@click.option(
+    "--update-baseline",
+    is_flag=True,
+    help=(
+        "Instead of suppressing, fold every current finding into --baseline "
+        "(creating it if needed) and don't fail the build."
+    ),
+)
 @click.version_option(package_name="llm-appsec-scanner", prog_name="llm-appsec-scanner")
 def main(
     target: Path,
@@ -108,6 +125,8 @@ def main(
     chunk_lines: int | None,
     quiet: bool,
     no_fail: bool,
+    baseline_path: Path | None,
+    update_baseline: bool,
 ) -> None:
     """LLM-assisted SAST scanner for OWASP/CWE-aligned vulnerability detection."""
     load_dotenv()
@@ -123,6 +142,10 @@ def main(
             f"[red]error:[/red] unsupported output format '{output.suffix}'. "
             "Use .json, .md or .sarif"
         )
+        sys.exit(EXIT_ERROR)
+
+    if update_baseline and not baseline_path:
+        err_console.print("[red]error:[/red] --update-baseline requires --baseline PATH")
         sys.exit(EXIT_ERROR)
 
     try:
@@ -168,6 +191,30 @@ def main(
 
     if report.summary.files_discovered == 0:
         console.print("[yellow]No supported source files found under the target.[/yellow]")
+
+    if baseline_path:
+        existing_baseline = load_baseline(baseline_path)
+        if update_baseline:
+            merged = merge_baseline(existing_baseline, report.findings)
+            save_baseline(merged, baseline_path)
+            for finding in report.findings:
+                finding.suppressed = True
+            report.rebuild_summary(files_discovered=report.summary.files_discovered)
+            console.print(
+                f"[green]baseline updated:[/green] {baseline_path} "
+                f"({len(merged.entries)} accepted findings)"
+            )
+            # The whole point of this run was to accept the current state,
+            # not to gate on it.
+            no_fail = True
+        else:
+            suppressed_count = apply_baseline(report, existing_baseline)
+            if suppressed_count:
+                report.rebuild_summary(files_discovered=report.summary.files_discovered)
+                console.print(
+                    f"[dim]{suppressed_count} finding(s) suppressed by baseline "
+                    f"({baseline_path})[/dim]"
+                )
 
     render_terminal(report, console=console, verbose=not quiet)
 
