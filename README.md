@@ -96,7 +96,7 @@ llm-appsec-scanner -t ./terraform -o security-report.md
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--target`, `-t` | *(required)* | File or directory to scan |
-| `--output`, `-o` | — | Report path; format inferred from `.json` / `.md` |
+| `--output`, `-o` | — | Report path; format inferred from `.json` / `.md` / `.sarif` |
 | `--severity-threshold` | `LOW` | Minimum severity to report and fail on |
 | `--model` | `gemini-3.7-flash` | Gemini model id. Falls back to `$LLM_APPSEC_MODEL`, then the built-in default |
 | `--rpm` | `15` | Client-side requests-per-minute cap |
@@ -163,6 +163,14 @@ src/db.py:18-20  •  CWE-89  •  A03:2021-Injection
 }
 ```
 
+### SARIF
+
+```bash
+llm-appsec-scanner -t ./src -o results.sarif
+```
+
+Produces a [SARIF 2.1.0](https://sarifweb.azurewebsites.net/) document — the format GitHub Code Scanning, Azure DevOps, and most CI security dashboards consume natively, showing findings as inline annotations on the offending lines instead of a separate file someone has to go open. `.sarif` and `.sarif.json` both work as the output extension.
+
 ---
 
 ## Architecture
@@ -192,9 +200,9 @@ src/db.py:18-20  •  CWE-89  •  A03:2021-Injection
                                 │  ScanReport
                     ┌───────────▼────────────┐
                     │     reporter.py        │
-                    └──┬──────────┬──────────┘
-                       │          │          │
-                   terminal     JSON      Markdown
+                    └─┬─────────┬────────┬──┬┘
+                      │         │        │  │
+                  terminal    JSON   Markdown SARIF
 ```
 
 Full design rationale lives in [docs/DESIGN.md](docs/DESIGN.md). A module-by-module walkthrough of how it was built is in [docs/FLOW.md](docs/FLOW.md).
@@ -243,6 +251,28 @@ jobs:
 ```
 
 The job fails when a HIGH or CRITICAL finding is present. Add `--no-fail` while you are baselining an existing codebase.
+
+### GitHub Code Scanning (SARIF)
+
+Swap the output to `.sarif` and upload it with GitHub's own action to get findings as inline annotations in the PR diff and the repo's Security tab, instead of a plain artifact:
+
+```yaml
+      - name: Run scan
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          llm-appsec-scanner \
+            --target ./src \
+            --output results.sarif \
+            --severity-threshold HIGH \
+            --no-fail   # let Code Scanning surface findings; don't also fail the step
+
+      - name: Upload to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+```
 
 ### GitLab CI
 

@@ -148,11 +148,21 @@ The gap 2f surfaced in itself, fixed: once Google's free-tier *daily* request qu
 - **Exit code is forced to `2` whenever a scan is truncated, unconditionally** — even if the files that did complete had CRITICAL findings. An incomplete scan must never be indistinguishable from a normal pass/fail result; CI should treat "the tool didn't finish" as its own failure mode, not quietly fold it into "found problems."
 - Covered by 8 new tests (marker detection, no-retry-on-daily-quota, propagation through `scan_file`, stop-early + skip-marking in `scan`, the forced exit code, and the Markdown warning). 64/64 tests passing.
 
+### 2h. SARIF output ✅
+
+A fourth `reporter.py` format — [SARIF 2.1.0](https://sarifweb.azurewebsites.net/) — so findings can land as native inline PR annotations in GitHub's Security tab instead of a separate file someone has to remember to open. No API calls needed to build or test this; it's a pure transformation of an existing `ScanReport`, chosen over `--baseline` specifically for that reason (see the recommendation at the top of this phase).
+
+- `render_sarif()` in `scanner/reporter.py`: deduplicates rules by `cwe_id` (one rule definition per CWE, one result per finding instance — matches how SARIF-consuming tools expect grouping to work); maps `Severity` to both SARIF's three-level `level` field and GitHub's separate `security-severity` 0–10 score, since they serve different UI purposes and only one of them has room for four buckets.
+- `_parse_line_region()` degrades gracefully: extracts min/max digits from the free-form `line_number_range` string and omits the `region` entirely if none are found, rather than fabricating a line number.
+- `partialFingerprints` gives GitHub a stable-ish identity per finding (`sha256(file_path | cwe_id | title)`) so repeat runs are tracked as the same alert rather than new ones — explicitly framed as a hint, not a solution to the harder cross-run matching problem `--baseline` will need to solve, especially given 2f's finding that the same underlying issue can come back reworded or under a different CWE on a non-deterministic model.
+- `report.truncated` (from 2g) carries through to SARIF too: a quota-truncated scan sets `invocations[0].executionSuccessful = false` with an explanatory notification, so GitHub's own UI can't present an incomplete run as a clean one.
+- `write_report()` and the CLI's `--output` validation both accept `.sarif` and `.sarif.json`; a GitHub Actions example using `github/codeql-action/upload-sarif` was added to the README.
+- Full design rationale in [DESIGN.md §4.10](DESIGN.md#410-sarif-output). Covered by 11 new tests (region parsing across malformed inputs, rule deduplication, severity mapping, truncation reflection, both output extensions, and CLI end-to-end). 75/75 tests passing.
+
 ### Remaining in Phase 2
 
 - Validate the tuned prompt against `gemini-3.7-flash` once quota resets (see 2f above).
-- Add a `--baseline` file to suppress accepted risks.
-- Add SARIF output for GitHub Code Scanning.
+- Add a `--baseline` file to suppress accepted risks — now informed by 2h's fingerprinting groundwork, but still needs its own design pass for cross-run matching under model non-determinism.
 
 ---
 

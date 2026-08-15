@@ -28,6 +28,15 @@ console = Console()
 err_console = Console(stderr=True)
 
 
+def _has_supported_output_extension(path: Path) -> bool:
+    """Mirrors reporter.write_report()'s format dispatch, checked up front so
+    a bad --output extension fails before any API quota is spent."""
+    name = path.name.lower()
+    if name.endswith(".sarif.json") or path.suffix.lower() == ".sarif":
+        return True
+    return path.suffix.lower() in {".json", ".md", ".markdown"}
+
+
 @click.command(name="llm-appsec-scanner")
 @click.option(
     "--target",
@@ -40,7 +49,7 @@ err_console = Console(stderr=True)
     "--output",
     "-o",
     type=click.Path(path_type=Path),
-    help="Write the report to this path (.json or .md).",
+    help="Write the report to this path (.json, .md or .sarif).",
 )
 @click.option(
     "--severity-threshold",
@@ -109,9 +118,10 @@ def main(
 
     threshold = Severity(severity_threshold.upper())
 
-    if output and output.suffix.lower() not in {".json", ".md", ".markdown"}:
+    if output and not _has_supported_output_extension(output):
         err_console.print(
-            f"[red]error:[/red] unsupported output format '{output.suffix}'. Use .json or .md"
+            f"[red]error:[/red] unsupported output format '{output.suffix}'. "
+            "Use .json, .md or .sarif"
         )
         sys.exit(EXIT_ERROR)
 

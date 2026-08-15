@@ -49,9 +49,9 @@ llm-appsec-scanner/
 │   ├── core.py            LLM orchestration
 │   ├── models.py          Pydantic schemas
 │   ├── file_handler.py    traversal, filtering, chunking
-│   └── reporter.py        JSON / Markdown / terminal
+│   └── reporter.py        JSON / Markdown / SARIF / terminal
 ├── tests/
-│   ├── test_scanner.py    64 tests, no network
+│   ├── test_scanner.py    75 tests, no network
 │   └── vulnerable_samples/
 ├── docs/
 │   ├── DESIGN.md          architecture and rationale
@@ -301,15 +301,16 @@ class LLMClient(Protocol):
 
 **File:** [`scanner/reporter.py`](../scanner/reporter.py)
 
-Three renderers over the same `ScanReport`. Each is a pure function of the report — no I/O except `write_report()`.
+Four renderers over the same `ScanReport`. Each is a pure function of the report — no I/O except `write_report()`.
 
 | Renderer | Consumer | Notes |
 | --- | --- | --- |
 | `render_terminal` | Developer at a keyboard | `rich` tables, severity colours, side-by-side syntax-highlighted patches |
 | `render_json` | CI, dashboards, other tools | `model_dump_json(indent=2)` — the Pydantic model *is* the schema |
 | `render_markdown` | PR comments, tickets, audits | Summary tables + per-file findings with fenced code |
+| `render_sarif` | GitHub Code Scanning, Azure DevOps, CI security dashboards | SARIF 2.1.0; see [DESIGN.md §4.10](DESIGN.md#410-sarif-output) for the rules-vs-results and severity-mapping rationale |
 
-`write_report()` picks the renderer from the file suffix and rejects anything other than `.json`/`.md`. The CLI validates the extension *before* constructing the client, so a typo cannot waste a scan's worth of quota.
+`write_report()` picks the renderer from the file suffix and rejects anything not `.json`, `.md`/`.markdown`, or `.sarif`/`.sarif.json`. `.sarif.json` is checked against the full filename, not just `Path.suffix` (which would only see `.json`). The CLI mirrors this exact check in `_has_supported_output_extension()` and validates it *before* constructing the client, so a typo cannot waste a scan's worth of quota.
 
 `_LANGUAGE_LEXER` maps internal language names to Pygments lexers (`terraform` → `hcl`), used for both terminal highlighting and Markdown fence tags.
 
@@ -355,7 +356,7 @@ The `2`-vs-`1` split matters in CI: a pipeline can distinguish "the scanner foun
 
 ## Module 7 — Testing
 
-**File:** [`tests/test_scanner.py`](../tests/test_scanner.py) — 64 tests, no network, no API key.
+**File:** [`tests/test_scanner.py`](../tests/test_scanner.py) — 75 tests, no network, no API key.
 
 ### The `FakeClient`
 

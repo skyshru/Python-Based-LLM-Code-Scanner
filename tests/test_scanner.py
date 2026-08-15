@@ -28,8 +28,14 @@ from scanner.file_handler import (
     read_source_file,
     SourceFile,
 )
-from scanner.models import ScanReport, Severity, Vulnerability
-from scanner.reporter import render_json, render_markdown, write_report
+from scanner.models import FileScanResult, ScanReport, Severity, Vulnerability
+from scanner.reporter import (
+    _parse_line_region,
+    render_json,
+    render_markdown,
+    render_sarif,
+    write_report,
+)
 
 SAMPLES = Path(__file__).parent / "vulnerable_samples"
 
@@ -598,6 +604,85 @@ def test_render_markdown_includes_truncation_warning():
     assert "Stopped after 1 of 3" in md
 
 
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("18-20", {"startLine": 18, "endLine": 20}),
+        ("18", {"startLine": 18}),
+        ("18,25", {"startLine": 18, "endLine": 25}),
+        ("251,258", {"startLine": 251, "endLine": 258}),
+        ("unknown", None),
+        ("", None),
+    ],
+)
+def test_parse_line_region(raw, expected):
+    assert _parse_line_region(raw) == expected
+
+
+def test_render_sarif_structure(tmp_path: Path):
+    report = _report_with_finding(tmp_path)
+    sarif = json.loads(render_sarif(report))
+
+    assert sarif["version"] == "2.1.0"
+    run = sarif["runs"][0]
+    assert run["tool"]["driver"]["name"] == "llm-appsec-scanner"
+
+    rules = run["tool"]["driver"]["rules"]
+    assert len(rules) == 1
+    assert rules[0]["id"] == "CWE-89"
+    assert rules[0]["properties"]["security-severity"] == "9.5"  # CRITICAL
+    assert rules[0]["helpUri"] == "https://cwe.mitre.org/data/definitions/89.html"
+
+    results = run["results"]
+    assert len(results) == 1
+    assert results[0]["ruleId"] == "CWE-89"
+    assert results[0]["level"] == "error"
+    assert results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == "a.py"
+    assert results[0]["locations"][0]["physicalLocation"]["region"] == {
+        "startLine": 18,
+        "endLine": 20,
+    }
+    assert "llmAppsecScannerFingerprint/v1" in results[0]["partialFingerprints"]
+
+    assert run["invocations"][0]["executionSuccessful"] is True
+
+
+def test_render_sarif_dedupes_rules_by_cwe():
+    findings = [_finding(vid="SEC-001", line="10"), _finding(vid="SEC-002", line="50")]
+    report = ScanReport()
+    report.results = [
+        FileScanResult(
+            file_path="a.py",
+            vulnerabilities=[Vulnerability.model_validate(f) for f in findings],
+        )
+    ]
+    sarif = json.loads(render_sarif(report))
+
+    assert len(sarif["runs"][0]["tool"]["driver"]["rules"]) == 1
+    assert len(sarif["runs"][0]["results"]) == 2
+    assert {r["ruleIndex"] for r in sarif["runs"][0]["results"]} == {0}
+
+
+def test_render_sarif_reflects_truncation():
+    report = ScanReport(truncated=True, truncation_reason="Stopped after 1 of 3 files: boom")
+    sarif = json.loads(render_sarif(report))
+    invocation = sarif["runs"][0]["invocations"][0]
+    assert invocation["executionSuccessful"] is False
+    assert "Stopped after 1 of 3" in invocation["toolExecutionNotifications"][0]["message"]["text"]
+
+
+def test_write_report_sarif_extension(tmp_path: Path):
+    report = _report_with_finding(tmp_path)
+
+    sarif_path = write_report(report, tmp_path / "out" / "results.sarif")
+    sarif_json_path = write_report(report, tmp_path / "out" / "results.sarif.json")
+
+    for path in (sarif_path, sarif_json_path):
+        data = json.loads(path.read_text())
+        assert data["version"] == "2.1.0"
+        assert data["runs"][0]["results"][0]["ruleId"] == "CWE-89"
+
+
 def test_write_report_json_and_markdown(tmp_path: Path):
     report = _report_with_finding(tmp_path)
 
@@ -770,6 +855,30 @@ def test_cli_writes_output_file(tmp_path: Path, monkeypatch):
 
     CliRunner().invoke(cli_module.main, ["--target", str(src), "--output", str(out)])
     assert json.loads(out.read_text())["summary"]["total_findings"] == 1
+
+
+def test_cli_writes_sarif_output(tmp_path: Path, monkeypatch):
+    from click.testing import CliRunner
+
+    from scanner import cli as cli_module
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.py").write_text("x = 1\n")
+    out = tmp_path / "results.sarif"
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        cli_module,
+        "GeminiClient",
+        lambda **kw: FakeClient(json.dumps({"vulnerabilities": [_finding()]})),
+    )
+
+    result = CliRunner().invoke(cli_module.main, ["--target", str(src), "--output", str(out)])
+    data = json.loads(out.read_text())
+    assert data["version"] == "2.1.0"
+    assert data["runs"][0]["results"][0]["ruleId"] == "CWE-89"
+    assert result.exit_code == 1  # findings still gate the build normally
 
 
 def test_cli_exits_2_when_truncated_even_with_findings(tmp_path: Path, monkeypatch):

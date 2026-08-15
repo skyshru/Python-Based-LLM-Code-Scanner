@@ -187,6 +187,20 @@ Five design choices in `SYSTEM_PROMPT` are load-bearing:
 4. **A concrete severity rubric** — mapping CRITICAL/HIGH/MEDIUM/LOW to exploitability makes severity comparable across files and runs.
 5. **"An empty result is a correct and expected answer"** — models are strongly biased toward producing *something*. Explicitly blessing the empty array is what makes clean files actually come back clean.
 
+### 4.10 SARIF output
+
+A fourth `reporter.py` format alongside terminal/JSON/Markdown, targeting [SARIF 2.1.0](https://sarifweb.azurewebsites.net/), the format GitHub Code Scanning (and most other CI security dashboards) consume natively for inline PR annotations.
+
+**Rules vs. results, deduplicated by CWE.** SARIF distinguishes a *rule* (a category of check) from a *result* (one instance of it firing). `render_sarif()` builds one rule per distinct `cwe_id` across all findings and has every result reference it by index — five SQL-injection findings across a repo become five results under one `CWE-89` rule, not five duplicate rule definitions. This is also what SARIF-consuming tools expect for meaningful grouping in their UI.
+
+**`level` and `security-severity` are two different fields with two different jobs.** SARIF's own `level` (`error`/`warning`/`note`) only has three useful buckets, so CRITICAL and HIGH both map to `error` — there's no fourth level to spend on it. GitHub Code Scanning separately reads `properties["security-severity"]`, a free-form 0.0–10.0 score, to render its own Critical/High/Medium/Low badge; `SARIF_SECURITY_SEVERITY` maps each `Severity` to a representative value inside GitHub's documented bucket ranges so the badge in GitHub's UI actually matches the tool's own severity, not a flattened three-way split.
+
+**Region parsing degrades gracefully.** `line_number_range` is intentionally loose in `models.py` (`"18"`, `"18-20"`, `"18,25"`) since it comes straight from the model. SARIF wants integer `startLine`/`endLine`. `_parse_line_region()` takes the min and max of whatever digits are present and returns `None` — omitting the `region` entirely rather than guessing — when there aren't any, so a malformed line reference degrades to "flagged this file" instead of a wrong or fabricated line number.
+
+**Fingerprints are a hint, not a solution.** `partialFingerprints` lets GitHub track "the same" alert across commits instead of treating every run as entirely new findings. The hash is `sha256(file_path | cwe_id | title.lower())` — deliberately not the full cross-run identity problem the future `--baseline` feature needs to solve. The prompt-tuning work in Phase 2f demonstrated that the same underlying issue can come back with a reworded title or even a different CWE between runs on a non-deterministic model; this fingerprint only helps when a finding is worded consistently, which is most of the time but not a guarantee.
+
+**A truncated scan is not a successful SARIF run.** Mirrors the exit-code principle from §4.7a: `report.truncated` sets `invocations[0].executionSuccessful = false` with a `toolExecutionNotifications` entry explaining why, so GitHub Code Scanning's own UI reflects the incomplete run rather than presenting partial results as if the scan had finished cleanly.
+
 ---
 
 ## 5. Data Model
