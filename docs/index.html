@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>llm-appsec-scanner — Case File</title>
+<meta name="description" content="A client-facing pitch for llm-appsec-scanner — real findings from a live scan, how it works, and how it fits a CI pipeline.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%8D%3C/text%3E%3C/svg%3E">
+<style>
+  /* ------------------------------------------------------------------
+     Deliberately fixed dual-tone "dossier" aesthetic: dark evidence
+     bands alternate with paper narrative bands as a content structure,
+     not a response to the viewer's OS theme. Every band paints its own
+     explicit background/text so the page holds on either host ground.
+     ------------------------------------------------------------------ */
+
+  :root {
+    /* dark "evidence" tone */
+    --ink-900: #10141c;
+    --ink-800: #171c26;
+    --ink-700: #1f2530;
+    --ink-line: #2b3242;
+    --ink-text: #ece9e1;
+    --ink-text-soft: #a49e8d;
+
+    /* light "narrative" tone */
+    --paper: #f3f4f7;
+    --paper-raised: #e7e9ee;
+    --paper-line: #d7dae1;
+    --paper-text: #171b22;
+    --paper-text-soft: #5d6273;
+
+    /* brand accent — brass/amber, used for flags, links, CTAs */
+    --accent: #b8691e;
+    --accent-ink: #8f4e12;
+    --accent-on-dark: #e3a85e;
+    --accent-soft-paper: #f0ddc0;
+
+    /* verified / fixed state — muted teal, distinct from accent */
+    --verified: #2b7863;
+    --verified-ink: #1e5a4a;
+    --verified-on-dark: #7cc9af;
+
+    /* severity ramp — semantic only, never used as the brand accent */
+    --sev-low-bg: #6e7c97;
+    --sev-med-bg: #cba135;
+    --sev-med-text: #17130a;
+    --sev-high-bg: #c1602f;
+    --sev-crit-bg: #7a2430;
+
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "URW Palladio L", Georgia, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0;
+    background: var(--ink-900);
+    color: var(--paper-text);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1, h2, h3 { font-family: var(--serif); font-weight: 400; text-wrap: balance; margin: 0; }
+  p { margin: 0; }
+  a { color: inherit; }
+
+  ::selection { background: var(--accent-soft-paper); color: var(--paper-text); }
+
+  a:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent-on-dark);
+    outline-offset: 3px;
+  }
+
+  /* ---------- page shell: fixed dark spine + scrolling content ---------- */
+
+  .page {
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    min-height: 100vh;
+  }
+
+  .rail {
+    background: var(--ink-900);
+    border-right: 1px solid var(--ink-line);
+    padding: 2.25rem 1.5rem;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .rail__mark {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--accent-on-dark);
+    letter-spacing: 0.02em;
+  }
+
+  .rail__nav {
+    list-style: none;
+    margin: 2.5rem 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+  }
+
+  .rail__nav a {
+    text-decoration: none;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.1em;
+    color: var(--ink-text-soft);
+    transition: color 0.15s ease;
+  }
+  .rail__nav a:hover { color: var(--ink-text); }
+  .rail__nav a::before { content: "» "; color: var(--accent-on-dark); opacity: 0; transition: opacity 0.15s ease; }
+  .rail__nav a:hover::before { opacity: 1; }
+
+  .rail__foot {
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    color: var(--ink-text-soft);
+    line-height: 1.6;
+  }
+
+  @media (max-width: 860px) {
+    .page { grid-template-columns: 1fr; }
+    .rail {
+      position: static;
+      height: auto;
+      flex-direction: row;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1rem 1.25rem;
+    }
+    .rail__nav, .rail__foot { display: none; }
+  }
+
+  /* ---------- bands ---------- */
+
+  .band { padding: 5.5rem 1.75rem; }
+  .band--dark { background: var(--ink-900); color: var(--ink-text); }
+  .band--dark-raised { background: var(--ink-800); color: var(--ink-text); }
+  .band--light { background: var(--paper); color: var(--paper-text); }
+  .band--light-raised { background: var(--paper-raised); color: var(--paper-text); }
+
+  .wrap { max-width: 920px; margin: 0 auto; }
+  .prose { max-width: 640px; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    display: inline-block;
+    margin-bottom: 1.25rem;
+  }
+  .band--dark .eyebrow, .band--dark-raised .eyebrow { color: var(--accent-on-dark); }
+  .band--light .eyebrow, .band--light-raised .eyebrow { color: var(--accent-ink); }
+
+  .h1 { font-size: clamp(2.1rem, 4.6vw, 3.4rem); line-height: 1.08; }
+  .h2 { font-size: clamp(1.55rem, 3vw, 2.15rem); line-height: 1.15; margin-bottom: 1.5rem; }
+
+  .lede {
+    font-size: 1.15rem;
+    line-height: 1.6;
+    margin-top: 1.25rem;
+  }
+  .band--dark .lede, .band--dark-raised .lede { color: var(--ink-text-soft); }
+  .band--light .lede, .band--light-raised .lede { color: var(--paper-text-soft); }
+
+  .body-text {
+    font-size: 1.0625rem;
+    line-height: 1.75;
+  }
+  .body-text + .body-text { margin-top: 1.1rem; }
+  .band--dark .body-text, .band--dark-raised .body-text { color: var(--ink-text-soft); }
+  .band--light .body-text, .band--light-raised .body-text { color: var(--paper-text-soft); }
+
+  .caption {
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    margin-top: 1rem;
+  }
+  .band--dark .caption, .band--dark-raised .caption { color: var(--ink-text-soft); }
+  .band--light .caption, .band--light-raised .caption { color: var(--paper-text-soft); }
+
+  /* ---------- chips ---------- */
+
+  .chips { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1.1rem; }
+  .chip {
+    font-family: var(--mono);
+    font-size: 0.74rem;
+    letter-spacing: 0.03em;
+    padding: 0.3rem 0.6rem;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+  .chip--outline-dark { border: 1px solid var(--ink-line); color: var(--ink-text-soft); }
+  .chip--sev-critical { background: var(--sev-crit-bg); color: #f7f5f0; }
+  .chip--sev-high { background: var(--sev-high-bg); color: #f7f5f0; }
+  .chip--sev-medium { background: var(--sev-med-bg); color: var(--sev-med-text); }
+
+  /* ---------- diff panel ---------- */
+
+  .diff-panel {
+    background: var(--ink-800);
+    border: 1px solid var(--ink-line);
+    margin-top: 2rem;
+  }
+  .diff-panel__head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.85rem 1.1rem;
+    border-bottom: 1px solid var(--ink-line);
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--ink-text-soft);
+    flex-wrap: wrap;
+  }
+  .diff-panel__file { color: var(--ink-text); }
+
+  .diff-block__label {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 0.6rem 1.1rem 0.3rem;
+  }
+  .diff-block--vuln { border-left: 3px solid var(--sev-crit-bg); }
+  .diff-block--vuln .diff-block__label { color: var(--sev-high-bg); }
+  .diff-block--fixed { border-left: 3px solid var(--verified); border-top: 1px solid var(--ink-line); }
+  .diff-block--fixed .diff-block__label { color: var(--verified-on-dark); }
+
+  pre.diff-code {
+    margin: 0;
+    padding: 0.3rem 1.1rem 1rem;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    line-height: 1.65;
+  }
+  .diff-line { display: block; white-space: pre; opacity: 1; }
+  .diff-line--del { color: #e8b3b3; }
+  .diff-line--del .diff-line__mark { color: var(--sev-high-bg); }
+  .diff-line--add { color: #b9e0d0; }
+  .diff-line--add .diff-line__mark { color: var(--verified-on-dark); }
+  .diff-line__mark { display: inline-block; width: 1.2em; user-select: none; }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .diff-line {
+      opacity: 0;
+      transform: translateY(4px);
+      animation: revealLine 0.5s ease forwards;
+    }
+    .diff-block--vuln .diff-line:nth-child(1) { animation-delay: 0.15s; }
+    .diff-block--vuln .diff-line:nth-child(2) { animation-delay: 0.32s; }
+    .diff-block--vuln .diff-line:nth-child(3) { animation-delay: 0.49s; }
+    .diff-block--fixed .diff-line:nth-child(1) { animation-delay: 0.7s; }
+    .diff-block--fixed .diff-line:nth-child(2) { animation-delay: 0.82s; }
+    .diff-block--fixed .diff-line:nth-child(3) { animation-delay: 0.94s; }
+    .diff-block--fixed .diff-line:nth-child(4) { animation-delay: 1.06s; }
+  }
+  @keyframes revealLine {
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .diff-panel--compact pre.diff-code { font-size: 0.8rem; }
+  .diff-panel--compact { margin-top: 0; }
+
+  /* ---------- approach flow ---------- */
+
+  .flow {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--paper-line);
+    border: 1px solid var(--paper-line);
+    margin-top: 2.5rem;
+  }
+  .flow__step { background: var(--paper); padding: 1.5rem 1.35rem; }
+  .flow__num {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--accent-ink);
+    margin-bottom: 0.6rem;
+    display: block;
+  }
+  .flow__title { font-weight: 600; font-size: 1rem; margin-bottom: 0.5rem; }
+  .flow__desc { font-size: 0.92rem; line-height: 1.55; color: var(--paper-text-soft); }
+
+  @media (max-width: 760px) {
+    .flow { grid-template-columns: 1fr; }
+  }
+
+  /* ---------- proof stats ---------- */
+
+  .stat-row {
+    display: grid;
+    grid-template-columns: repeat(3, auto);
+    gap: 3rem;
+    margin-top: 2.5rem;
+  }
+  .stat__num {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    font-size: clamp(2rem, 4.5vw, 2.9rem);
+    color: var(--ink-text);
+    line-height: 1;
+  }
+  .stat__label {
+    font-family: var(--mono);
+    font-size: 0.74rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-text-soft);
+    margin-top: 0.6rem;
+  }
+  @media (max-width: 640px) {
+    .stat-row { grid-template-columns: 1fr 1fr; gap: 1.75rem 2rem; }
+  }
+
+  .sev-bar {
+    display: flex;
+    height: 14px;
+    margin-top: 3rem;
+    border: 1px solid var(--ink-line);
+    overflow: hidden;
+  }
+  .sev-bar__seg--crit { flex: 2; background: var(--sev-crit-bg); }
+  .sev-bar__seg--high { flex: 11; background: var(--sev-high-bg); }
+  .sev-bar__seg--med  { flex: 3;  background: var(--sev-med-bg); }
+
+  .sev-legend {
+    display: flex;
+    gap: 1.75rem;
+    flex-wrap: wrap;
+    margin-top: 1rem;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--ink-text-soft);
+  }
+  .sev-legend__dot { display: inline-block; width: 9px; height: 9px; margin-right: 0.45rem; }
+
+  .file-table { width: 100%; border-collapse: collapse; margin-top: 3rem; }
+  .file-table th, .file-table td {
+    text-align: left;
+    padding: 0.85rem 1rem;
+    border-bottom: 1px solid var(--ink-line);
+    font-size: 0.92rem;
+    vertical-align: top;
+  }
+  .file-table th {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-text-soft);
+    font-weight: 400;
+  }
+  .file-table td:first-child { font-family: var(--mono); color: var(--ink-text); white-space: nowrap; }
+  .file-table td:nth-child(2) {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--accent-on-dark);
+  }
+  .file-table td:last-child { color: var(--ink-text-soft); }
+  .file-table-wrap { overflow-x: auto; }
+
+  /* ---------- comparison table ---------- */
+
+  .compare-wrap { overflow-x: auto; margin-top: 2.5rem; }
+  .compare {
+    width: 100%;
+    min-width: 560px;
+    border-collapse: collapse;
+  }
+  .compare th, .compare td {
+    padding: 0.9rem 1.1rem;
+    text-align: left;
+    border-bottom: 1px solid var(--paper-line);
+    font-size: 0.94rem;
+  }
+  .compare thead th {
+    background: var(--ink-900);
+    color: var(--ink-text);
+    font-family: var(--mono);
+    font-size: 0.74rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-weight: 400;
+  }
+  .compare tbody th {
+    font-weight: 600;
+    color: var(--paper-text);
+    white-space: nowrap;
+  }
+  .compare td { color: var(--paper-text-soft); }
+  .compare td.yes { color: var(--verified-ink); font-weight: 600; }
+  .compare td.no { color: var(--paper-text-soft); }
+
+  /* ---------- pipeline ---------- */
+
+  .exit-codes {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1px;
+    background: var(--ink-line);
+    border: 1px solid var(--ink-line);
+    margin-top: 2.5rem;
+  }
+  .exit-code { background: var(--ink-800); padding: 1.35rem; }
+  .exit-code__num {
+    font-family: var(--mono);
+    font-size: 1.6rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .exit-code--clean .exit-code__num { color: var(--verified-on-dark); }
+  .exit-code--findings .exit-code__num { color: var(--sev-high-bg); }
+  .exit-code--error .exit-code__num { color: var(--ink-text-soft); }
+  .exit-code__label {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-text-soft);
+    margin-top: 0.4rem;
+  }
+  .exit-code__desc { font-size: 0.86rem; color: var(--ink-text-soft); margin-top: 0.6rem; line-height: 1.5; }
+
+  @media (max-width: 640px) { .exit-codes { grid-template-columns: 1fr; } }
+
+  pre.yaml {
+    margin: 2rem 0 0;
+    background: var(--ink-900);
+    border: 1px solid var(--ink-line);
+    padding: 1.1rem 1.25rem;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    line-height: 1.7;
+    color: var(--ink-text-soft);
+  }
+  pre.yaml .k { color: var(--accent-on-dark); }
+  pre.yaml .s { color: var(--verified-on-dark); }
+
+  /* ---------- roadmap ---------- */
+
+  .roadmap { margin-top: 2.5rem; display: flex; flex-direction: column; gap: 1.75rem; }
+  .roadmap__row { display: grid; grid-template-columns: 140px 1fr; gap: 1.25rem; padding-bottom: 1.75rem; border-bottom: 1px solid var(--paper-line); }
+  .roadmap__row:last-child { border-bottom: none; padding-bottom: 0; }
+  .roadmap__phase { font-family: var(--mono); font-size: 0.8rem; color: var(--accent-ink); }
+  .roadmap__items { font-size: 0.98rem; line-height: 1.8; color: var(--paper-text-soft); }
+  @media (max-width: 640px) { .roadmap__row { grid-template-columns: 1fr; gap: 0.4rem; } }
+
+  /* ---------- cta ---------- */
+
+  .cta-btn {
+    display: inline-block;
+    margin-top: 2.25rem;
+    padding: 0.95rem 1.9rem;
+    background: var(--accent);
+    color: #fff8ef;
+    text-decoration: none;
+    font-family: var(--mono);
+    font-size: 0.88rem;
+    letter-spacing: 0.04em;
+    border: 1px solid var(--accent);
+    transition: transform 0.15s ease, background 0.15s ease;
+  }
+  .cta-btn:hover { background: #a15a19; transform: translateY(-1px); }
+
+  footer.band {
+    padding-top: 3rem;
+    padding-bottom: 3rem;
+  }
+  .foot-row {
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 1rem;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--ink-text-soft);
+  }
+</style>
+</head>
+<body>
+<div class="page">
+  <nav class="rail" aria-label="Section index">
+    <div class="rail__mark">// llm-appsec-scanner</div>
+    <ul class="rail__nav">
+      <li><a href="#cover">Cover</a></li>
+      <li><a href="#problem">The Problem</a></li>
+      <li><a href="#method">The Method</a></li>
+      <li><a href="#evidence">The Evidence</a></li>
+      <li><a href="#compare">The Comparison</a></li>
+      <li><a href="#pipeline">Your Pipeline</a></li>
+      <li><a href="#roadmap">What's Next</a></li>
+      <li><a href="#ask">The Ask</a></li>
+    </ul>
+    <div class="rail__foot">CASE FILE<br>NO. 001</div>
+  </nav>
+
+  <main>
+
+    <!-- COVER / HERO -->
+    <section id="cover" class="band band--dark">
+      <div class="wrap">
+        <span class="eyebrow">Case file No. 001 — llm-appsec-scanner</span>
+        <h1 class="h1">It read three files and found what a scanner isn't supposed to be able to find.</h1>
+        <p class="lede prose">Not a linter. Not a pattern match against a rules file. An AI security engineer that reads code for intent, then hands back the fix — not just the flag.</p>
+
+        <div class="diff-panel">
+          <div class="diff-panel__head">
+            <span class="diff-panel__file">sample_hardcoded_keys.py:35&ndash;37</span>
+            <span>SEC-001</span>
+          </div>
+          <div class="chips" style="padding: 0 1.1rem;">
+            <span class="chip chip--sev-critical">CRITICAL</span>
+            <span class="chip chip--outline-dark">CWE-502</span>
+            <span class="chip chip--outline-dark">A08:2021 — Software &amp; Data Integrity Failures</span>
+          </div>
+
+          <div class="diff-block diff-block--vuln">
+            <span class="diff-block__label">Found</span>
+            <pre class="diff-code"><span class="diff-line diff-line--del"><span class="diff-line__mark">-</span>def load_session(blob: bytes):</span><span class="diff-line diff-line--del"><span class="diff-line__mark">-</span>    # CWE-502: deserializing untrusted input yields RCE.</span><span class="diff-line diff-line--del"><span class="diff-line__mark">-</span>    return pickle.loads(blob)</span></pre>
+          </div>
+          <div class="diff-block diff-block--fixed">
+            <span class="diff-block__label">Patched</span>
+            <pre class="diff-code"><span class="diff-line diff-line--add"><span class="diff-line__mark">+</span>import json</span><span class="diff-line diff-line--add"><span class="diff-line__mark">+</span></span><span class="diff-line diff-line--add"><span class="diff-line__mark">+</span>def load_session(blob: bytes):</span><span class="diff-line diff-line--add"><span class="diff-line__mark">+</span>    return json.loads(blob.decode("utf-8"))</span></pre>
+          </div>
+        </div>
+        <p class="caption">Real output from a live run against <em>tests/vulnerable_samples/sample_hardcoded_keys.py</em>. Lines verified against source. Not a mockup.</p>
+      </div>
+    </section>
+
+    <!-- PROBLEM -->
+    <section id="problem" class="band band--light">
+      <div class="wrap">
+        <span class="eyebrow">The Problem</span>
+        <h2 class="h2 prose">Pattern matching finds syntax. It doesn't find intent.</h2>
+        <div class="prose">
+          <p class="body-text">Traditional SAST tools are fast and deterministic because they match patterns: a regex, an AST rule, a known-bad function call. That works for <code>eval(user_input)</code>. It does not work for a handler that returns someone else's order because nobody checked whether the requesting user actually owns it — there is no syntactic pattern for "forgot an authorization check." That flaw, and most of what causes real breaches, lives in logic and intent, not syntax.</p>
+          <p class="body-text">The second cost is trust. Rule engines that fire on every stylistic near-miss train teams to stop reading their own security tooling's output. Signal-to-noise ratio, not raw detection count, is usually what kills a SAST rollout.</p>
+          <p class="body-text">An LLM reads code closer to how a reviewer does. It can hold intent, not just syntax, in view — and it can tell you why something is wrong, not just that it matched a rule ID.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- METHOD -->
+    <section id="method" class="band band--light-raised">
+      <div class="wrap">
+        <span class="eyebrow">The Method</span>
+        <h2 class="h2 prose">Four steps. No dashboard to learn.</h2>
+        <div class="flow">
+          <div class="flow__step">
+            <span class="flow__num">01</span>
+            <div class="flow__title">Point it at code</div>
+            <div class="flow__desc">A single file or a whole repo. Python, JS/TS, Go, Java, Terraform, YAML — it already knows what to skip: <code>.git</code>, <code>node_modules</code>, lockfiles, binaries.</div>
+          </div>
+          <div class="flow__step">
+            <span class="flow__num">02</span>
+            <div class="flow__title">It reads like a reviewer</div>
+            <div class="flow__desc">Every file is reviewed by an LLM under a security-engineer system prompt spanning OWASP Top 10, CWE, hardcoded secrets, and cloud/IaC misconfiguration.</div>
+          </div>
+          <div class="flow__step">
+            <span class="flow__num">03</span>
+            <div class="flow__title">Findings, not prose</div>
+            <div class="flow__desc">Every result is schema-validated: severity, CWE, exact lines, a working before/after patch. Nothing to parse by hand.</div>
+          </div>
+          <div class="flow__step">
+            <span class="flow__num">04</span>
+            <div class="flow__title">Set the bar, wire it in</div>
+            <div class="flow__desc">Choose a severity threshold. It exits 1 when something at or above it is found, 0 when the code is clean.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- EVIDENCE / PROOF -->
+    <section id="evidence" class="band band--dark">
+      <div class="wrap">
+        <span class="eyebrow">The Evidence</span>
+        <h2 class="h2 prose" style="color: var(--ink-text);">We didn't mock this. We ran it.</h2>
+        <p class="lede prose">One live scan, three deliberately vulnerable sample files, a real LLM API call — no rehearsed demo data.</p>
+
+        <div class="stat-row">
+          <div><div class="stat__num">3</div><div class="stat__label">Files scanned</div></div>
+          <div><div class="stat__num">0</div><div class="stat__label">Files failed</div></div>
+          <div><div class="stat__num">16</div><div class="stat__label">Findings</div></div>
+        </div>
+
+        <div class="sev-bar" role="img" aria-label="Severity breakdown: 2 critical, 11 high, 3 medium, 0 low">
+          <div class="sev-bar__seg--crit"></div>
+          <div class="sev-bar__seg--high"></div>
+          <div class="sev-bar__seg--med"></div>
+        </div>
+        <div class="sev-legend">
+          <span><span class="sev-legend__dot" style="background: var(--sev-crit-bg);"></span>2 Critical</span>
+          <span><span class="sev-legend__dot" style="background: var(--sev-high-bg);"></span>11 High</span>
+          <span><span class="sev-legend__dot" style="background: var(--sev-med-bg);"></span>3 Medium</span>
+          <span><span class="sev-legend__dot" style="background: var(--sev-low-bg);"></span>0 Low</span>
+        </div>
+
+        <div class="file-table-wrap">
+          <table class="file-table">
+            <thead>
+              <tr><th>File</th><th>Findings</th><th>What it caught</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>sample_hardcoded_keys.py</td>
+                <td>6</td>
+                <td>Unsafe deserialization via <code>pickle.loads</code> (RCE), hardcoded AWS &amp; Stripe keys, unsalted MD5 password hashing, disabled TLS verification</td>
+              </tr>
+              <tr>
+                <td>sample_insecure_s3.tf</td>
+                <td>5</td>
+                <td>Public S3 bucket, <code>0.0.0.0/0</code> ingress on ports 22 &amp; 5432, unencrypted publicly-accessible RDS instance</td>
+              </tr>
+              <tr>
+                <td>sample_sqli.py</td>
+                <td>5</td>
+                <td>SQL injection via string concatenation and f-strings, OS command injection, path traversal</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="caption">Line numbers were spot-checked against source and matched exactly. Every proposed patch was syntactically valid on first run.</p>
+
+        <div class="diff-panel diff-panel--compact" style="margin-top: 3rem;">
+          <div class="diff-panel__head">
+            <span class="diff-panel__file">sample_hardcoded_keys.py:13&ndash;17 (excerpt)</span>
+            <span>SEC-002</span>
+          </div>
+          <div class="chips" style="padding: 0 1.1rem;">
+            <span class="chip chip--sev-high">HIGH</span>
+            <span class="chip chip--outline-dark">CWE-798</span>
+            <span class="chip chip--outline-dark">A07:2021 — Identification &amp; Authentication Failures</span>
+          </div>
+          <div class="diff-block diff-block--vuln">
+            <span class="diff-block__label">Found</span>
+            <pre class="diff-code"><span class="diff-line diff-line--del"><span class="diff-line__mark">-</span>AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE"</span><span class="diff-line diff-line--del"><span class="diff-line__mark">-</span>STRIPE_SECRET_KEY = "sk_live_NOT_A_REAL_KEY_SCANNER_TEST_FIXTURE"</span><span class="diff-line diff-line--del"><span class="diff-line__mark">-</span>DATABASE_URL = "postgresql://admin:SuperSecret123@db.internal:5432/production"</span></pre>
+          </div>
+          <div class="diff-block diff-block--fixed">
+            <span class="diff-block__label">Patched</span>
+            <pre class="diff-code"><span class="diff-line diff-line--add"><span class="diff-line__mark">+</span>AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")</span><span class="diff-line diff-line--add"><span class="diff-line__mark">+</span>STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")</span><span class="diff-line diff-line--add"><span class="diff-line__mark">+</span>DATABASE_URL = os.environ.get("DATABASE_URL")</span></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- COMPARE -->
+    <section id="compare" class="band band--light">
+      <div class="wrap">
+        <span class="eyebrow">The Comparison</span>
+        <h2 class="h2 prose">This doesn't replace Semgrep. It catches what Semgrep can't see.</h2>
+        <p class="lede prose">Rule engines and reasoning engines are good at different things. The honest pitch is to run both.</p>
+
+        <div class="compare-wrap">
+          <table class="compare">
+            <thead>
+              <tr><th></th><th>Rule-based SAST<br>(Semgrep, Bandit, tfsec)</th><th>llm-appsec-scanner</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <th>Known syntactic patterns</th>
+                <td class="yes">Yes — fast, deterministic</td>
+                <td class="yes">Yes</td>
+              </tr>
+              <tr>
+                <th>Business-logic &amp; access-control flaws</th>
+                <td class="no">Rarely — no rule for "forgot to check"</td>
+                <td class="yes">Yes — reasons about intent</td>
+              </tr>
+              <tr>
+                <th>Remediation guidance</th>
+                <td class="no">A rule ID and a link</td>
+                <td class="yes">A working before/after patch</td>
+              </tr>
+              <tr>
+                <th>Setup &amp; upkeep</th>
+                <td class="no">Rules to write and maintain</td>
+                <td class="yes">One prompt, zero custom rules</td>
+              </tr>
+              <tr>
+                <th>Speed &amp; determinism</th>
+                <td class="yes">Fast, identical output every run</td>
+                <td class="no">Slower — one model call per file</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- PIPELINE -->
+    <section id="pipeline" class="band band--dark-raised">
+      <div class="wrap">
+        <span class="eyebrow">Your Pipeline</span>
+        <h2 class="h2 prose" style="color: var(--ink-text);">It speaks exit codes, not dashboards.</h2>
+        <p class="lede prose">Drop it into a job. It gates the build on its own — no report to babysit.</p>
+
+        <div class="exit-codes">
+          <div class="exit-code exit-code--clean">
+            <div class="exit-code__num">0</div>
+            <div class="exit-code__label">Clean</div>
+            <div class="exit-code__desc">Nothing at or above your severity threshold. Build proceeds.</div>
+          </div>
+          <div class="exit-code exit-code--findings">
+            <div class="exit-code__num">1</div>
+            <div class="exit-code__label">Findings</div>
+            <div class="exit-code__desc">Something actionable was found. Build fails — on purpose.</div>
+          </div>
+          <div class="exit-code exit-code--error">
+            <div class="exit-code__num">2</div>
+            <div class="exit-code__label">Tool error</div>
+            <div class="exit-code__desc">Missing key, bad target, bad output path. The pipeline broke, not the code.</div>
+          </div>
+        </div>
+
+        <pre class="yaml"><span class="k">- name:</span> Run security scan
+  <span class="k">env:</span>
+    <span class="k">GEMINI_API_KEY:</span> <span class="s">${{ secrets.GEMINI_API_KEY }}</span>
+  <span class="k">run:</span> |
+    llm-appsec-scanner \
+      --target ./src \
+      --output security-report.md \
+      --severity-threshold HIGH</pre>
+      </div>
+    </section>
+
+    <!-- ROADMAP -->
+    <section id="roadmap" class="band band--light">
+      <div class="wrap">
+        <span class="eyebrow">What's Next</span>
+        <h2 class="h2 prose">Built for depth first. Scale is next.</h2>
+
+        <div class="roadmap">
+          <div class="roadmap__row">
+            <div class="roadmap__phase">Phase 2<br>in progress</div>
+            <div class="roadmap__items">A baseline file to suppress accepted risk instead of re-reporting it every run · SARIF output for native GitHub Code Scanning annotations.</div>
+          </div>
+          <div class="roadmap__row">
+            <div class="roadmap__phase">Phase 3<br>planned</div>
+            <div class="roadmap__items">Concurrent file scanning for large repos · a git-diff mode that scans only what changed in a PR · a repository-context pass to catch flaws that span files.</div>
+          </div>
+          <div class="roadmap__row">
+            <div class="roadmap__phase">Phase 4<br>planned</div>
+            <div class="roadmap__items">Packaged distribution (PyPI, container image, GitHub Action) · a pluggable local-model backend for teams whose code can't leave the building.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ASK -->
+    <section id="ask" class="band band--dark">
+      <div class="wrap">
+        <span class="eyebrow">The Ask</span>
+        <h2 class="h1 prose">Point it at one file. See what comes back.</h2>
+        <p class="lede prose">No slide can substitute for your own code and your own findings. A pilot scan on a real file from your codebase is the fastest way to know if this earns a place in your pipeline.</p>
+        <a class="cta-btn" href="mailto:vinitkundu14@gmail.com?subject=llm-appsec-scanner%20pilot">Request a pilot scan &rarr;</a>
+      </div>
+    </section>
+
+    <footer class="band band--dark">
+      <div class="wrap foot-row">
+        <span>llm-appsec-scanner · v0.1.0 · Phase 2</span>
+        <span>Complements Semgrep, Bandit &amp; tfsec — doesn't replace them</span>
+      </div>
+    </footer>
+
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-appsec-scanner"
+version = "0.1.0"
+description = "LLM-assisted SAST scanner using Google Gemini for OWASP/CWE-aligned vulnerability detection"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "google-genai>=0.3.0",
+    "pydantic>=2.6",
+    "click>=8.1",
+    "rich>=13.7",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.14",
+]
+
+[project.scripts]
+llm-appsec-scanner = "scanner.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["scanner*"]
