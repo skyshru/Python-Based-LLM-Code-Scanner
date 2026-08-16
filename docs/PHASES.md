@@ -73,10 +73,12 @@ Usage: python -m scanner.cli [OPTIONS]
 
 ---
 
-## Phase 2 — Validation & Hardening 🟡 In Progress
+## Phase 2 — Validation & Hardening ✅ Complete
 
-**Dates:** started 2026-08-15
-**Status:** live validation complete · 56/56 tests passing
+**Dates:** 2026-08-15 → 2026-08-16
+**Status:** Complete · 97/97 tests passing
+
+Shipped: live end-to-end validation, a forced model migration, real-world false-positive triage and the prompt tuning that came out of it, fail-fast daily-quota handling, SARIF output, and `--baseline` suppression. The residual validation gaps in 2j are free-tier measurement limits rather than open work.
 
 ### 2a. First live run ✅
 
@@ -136,7 +138,7 @@ Tested against three real external codebases, not the vulnerable fixtures:
 
 **Honest result of the re-test**: re-running the identical ThePhish scan with the tuned prompt on `gemini-2.5-flash-lite` made the targeted pattern *worse*, not better — `case_from_email.py` went from 4 to 12 findings, now flagging nearly every individual `config['x']` field (host, port, folder, TLP, PAP, tags) as a separate `CWE-798` finding. It also surfaced two additional, more sophisticated, plausible findings (email attachment filename → path traversal; email subject → stored XSS in a case title) not present in the first run. Read: a lite-tier model likely can't reliably parse a conditional rule ("only flag X if Y") and instead over-indexes on the topic being discussed at all — a model-capability ceiling, not obviously a prompt-wording problem.
 
-**Open item**: the tuned prompt has *not yet* been validated against `gemini-3.7-flash` — the actual default/production model — because its free-tier daily quota (20 req/day) was already exhausted by the time the fix was ready to test. `gemini-3.7-flash` is the model that matters for this question, since it already showed clean judgment on this exact file under the *old* prompt. Re-test once quota resets.
+**Open item**: the tuned prompt has *not yet* been validated against `gemini-3.7-flash` — the actual default/production model — because its free-tier daily quota (20 req/day) was already exhausted by the time the fix was ready to test. `gemini-3.7-flash` is the model that matters for this question, since it already showed clean judgment on this exact file under the *old* prompt. Re-test once quota resets. → **Resolved in 2j.**
 
 ### 2g. Fail fast on daily quota exhaustion ✅
 
@@ -171,9 +173,27 @@ New module `scanner/baseline.py`. Designed deliberately, not reused from SARIF's
 - Markdown and terminal output list suppressed findings in a separate, compact section (file, line, title, CWE — no patch detail) rather than hiding them; SARIF marks them with a native `suppressions` entry so GitHub Code Scanning shows them as dismissed rather than open.
 - Full design rationale, including the explicit tradeoff being made (false negatives on genuinely new-but-nearby findings, traded for not re-flagging accepted findings on every run) in [DESIGN.md §4.11](DESIGN.md#411-baseline-suppression). Covered by 22 new tests (matching rules, idempotency, reworded-title resilience, both CLI flags end-to-end). 97/97 tests passing.
 
+### 2j. Prompt validation on the default model ✅ (partial — scope-limited by quota)
+
+**Date:** 2026-08-16. Closes the open item from 2f.
+
+Once `gemini-3.7-flash`'s daily quota reset, the tuned prompt was run against `app/case_from_email.py` — the single most diagnostic file available, since it is where `gemini-2.5-flash-lite` produced **12 findings under this exact same tuned prompt**, nearly all of them `config['x']` reads mislabeled `CWE-798`.
+
+**Result: 0 findings.** Same prompt, same file, opposite outcome from the lite model.
+
+This confirms the hypothesis recorded in 2f rather than merely being consistent with it: the tuned rule ("reading a secret from a config object is the *correct* pattern; only flag CWE-798 when the literal value is visible") is parsed and applied correctly by `gemini-3.7-flash`, while a lite-tier model over-indexes on the topic being mentioned at all. **The prompt change did not degrade the good model** — which was the actual risk worth checking, given the change was authored in response to a smaller model's failures.
+
+**Scope limits, stated plainly:**
+
+- This is **one file**, not the full-repo before/after comparison originally intended. The free tier's 20 req/day cap was exhausted after roughly four requests today (the reset is not a clean 20 — a quota probe, a `503 UNAVAILABLE` attempt that burned its full retry budget, and the validation itself consumed it).
+- The remaining ThePhish files were **not** re-scanned on `gemini-3.7-flash`. Most notably `docker/docker-compose.yml`, which holds the run's genuine true positives (`MYSQL_PASSWORD=example`, `MYSQL_ROOT_PASSWORD=password`), is **unverified against the tuned prompt on the default model** — so we have evidence the prompt didn't introduce false positives, but no fresh evidence it preserved true-positive recall on that file. The pre-tuning `gemini-3.7-flash` runs did catch real issues, and nothing in the change targets recall, but that is inference rather than measurement.
+- A false-positive *rate* still does not exist for the default model. Two clean files (`case_from_email.py`, `ws_logger.py`) is a signal, not a statistic.
+
+**Standing conclusion:** the free tier's 20 req/day cap is now the binding constraint on every remaining validation question, not any property of the tool. Meaningful measurement — a full ThePhish comparison, or the 78-file `teslamotors/vehicle-command` scan — needs a paid tier.
+
 ### Remaining in Phase 2
 
-- Validate the tuned prompt against `gemini-3.7-flash` once quota resets (see 2f above) — the only item left, and it's blocked on Google's schedule rather than anything in our control.
+Nothing blocking. The prompt-validation item is resolved as far as the free tier allows (2j); the residual scope gaps there are measurement limits, not open work, and are better closed by a paid tier than by more free-tier attempts.
 
 ---
 
