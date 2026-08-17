@@ -75,10 +75,10 @@ Usage: python -m scanner.cli [OPTIONS]
 
 ## Phase 2 — Validation & Hardening ✅ Complete
 
-**Dates:** 2026-08-15 → 2026-08-16
+**Dates:** 2026-08-15 → 2026-08-17
 **Status:** Complete · 97/97 tests passing
 
-Shipped: live end-to-end validation, a forced model migration, real-world false-positive triage and the prompt tuning that came out of it, fail-fast daily-quota handling, SARIF output, and `--baseline` suppression. The residual validation gaps in 2j are free-tier measurement limits rather than open work.
+Shipped: live end-to-end validation, a forced model migration, real-world false-positive triage and the prompt tuning that came out of it, fail-fast daily-quota handling, SARIF output, and `--baseline` suppression. The prompt tuning was then measured on the default model (2j, 2k): **zero false positives on the files that previously produced ~19, with true-positive recall confirmed intact.**
 
 ### 2a. First live run ✅
 
@@ -183,13 +183,40 @@ Once `gemini-3.7-flash`'s daily quota reset, the tuned prompt was run against `a
 
 This confirms the hypothesis recorded in 2f rather than merely being consistent with it: the tuned rule ("reading a secret from a config object is the *correct* pattern; only flag CWE-798 when the literal value is visible") is parsed and applied correctly by `gemini-3.7-flash`, while a lite-tier model over-indexes on the topic being mentioned at all. **The prompt change did not degrade the good model** — which was the actual risk worth checking, given the change was authored in response to a smaller model's failures.
 
-**Scope limits, stated plainly:**
+**Scope limits at time of writing:** this was one file; recall and a broader false-positive picture remained unmeasured. → **Both closed the following day, below.**
 
-- This is **one file**, not the full-repo before/after comparison originally intended. The free tier's 20 req/day cap was exhausted after roughly four requests today (the reset is not a clean 20 — a quota probe, a `503 UNAVAILABLE` attempt that burned its full retry budget, and the validation itself consumed it).
-- The remaining ThePhish files were **not** re-scanned on `gemini-3.7-flash`. Most notably `docker/docker-compose.yml`, which holds the run's genuine true positives (`MYSQL_PASSWORD=example`, `MYSQL_ROOT_PASSWORD=password`), is **unverified against the tuned prompt on the default model** — so we have evidence the prompt didn't introduce false positives, but no fresh evidence it preserved true-positive recall on that file. The pre-tuning `gemini-3.7-flash` runs did catch real issues, and nothing in the change targets recall, but that is inference rather than measurement.
-- A false-positive *rate* still does not exist for the default model. Two clean files (`case_from_email.py`, `ws_logger.py`) is a signal, not a statistic.
+### 2k. Precision and recall measured on the default model ✅
 
-**Standing conclusion:** the free tier's 20 req/day cap is now the binding constraint on every remaining validation question, not any property of the tool. Meaningful measurement — a full ThePhish comparison, or the 78-file `teslamotors/vehicle-command` scan — needs a paid tier.
+**Date:** 2026-08-17. Closes the two scope gaps left open in 2j, using a fresh daily quota deliberately (quota is perishable; Phase 3 work needs none of it, so spending it on measurement first was the correct ordering).
+
+**The recall question first**, since it was the higher risk: could the anti-speculation tuning have *suppressed* genuine findings? Scanned `docker/docker-compose.yml` — the file holding the run's real true positives.
+
+**Result: 3 HIGH findings, all genuine, and better classified than before.**
+
+| Issue | lite model (tuned) | `gemini-3.7-flash` (tuned) |
+| --- | --- | --- |
+| `MYSQL_PASSWORD=example` / `MYSQL_ROOT_PASSWORD=password` | 2 separate findings | 1 consolidated finding, `CWE-798` — correct, since the literal secret **is** visible in the given code, exactly the condition the tuned rule permits |
+| Unauthenticated Elasticsearch on all interfaces | `CWE-269` (wrong) | `CWE-306` Missing Authentication — accurate |
+| Docker socket mounted into container | `CWE-269` (wrong) | `CWE-250` Execution with Unnecessary Privileges — accurate |
+| **Total** | 5 findings | 3, correctly labeled |
+
+Verified by hand that the `CWE-798` finding's `vulnerable_code` matches source lines 81-85 verbatim. Recall is intact, and prompt rule 3 (accurate CWE/OWASP labeling) is demonstrably working on this model — the two mislabeled `CWE-269` findings from the lite run came back correctly classified.
+
+**The precision question second.** A full-repo scan reached 5 of 11 files before the daily cap (chunked files consume several requests each, so "20/day" covers far fewer than 20 files). The files it did complete are the ones that matter most — **exactly the four Python files that produced the bulk of the lite model's false positives**:
+
+| File | lite model (tuned prompt) | `gemini-3.7-flash` (tuned prompt) |
+| --- | --- | --- |
+| `app/case_from_email.py` | 12 findings, nearly all `config['x']` → `CWE-798` FPs | **0** |
+| `app/run_analysis.py` | 6 findings, same pattern | **0** |
+| `app/list_emails.py` | 1 FP | **0** |
+| `app/thephish_app.py` | 1 FP — the one whose "fix" removed `flask.escape()` | **0** |
+| `app/ws_logger.py` | 0 | **0** (measured 2026-08-16) |
+
+**Zero false positives across the four files that generated roughly nineteen of them on the lite model, with true-positive recall confirmed intact on the fifth.** That is the measurement 2f asked for, on the model that actually ships.
+
+**Remaining unmeasured:** the four JavaScript files (`bootstrap.min.js`, `bs-init.js`, `theme.js`, `thephish.js`). On the lite model these produced 3 findings, 2 of them false positives (a jQuery compatibility note mislabeled `CWE-20`; `document.createTextNode()` — a safe API — flagged as "potential XSS"). Worth checking eventually, but they are lower-signal than the Python files already covered, and no conclusion here depends on them.
+
+**Standing conclusion, unchanged:** the free tier's 20 req/day cap is the binding constraint on further validation, not any property of the tool. The `teslamotors/vehicle-command` scan (78 files, ~39,600 lines) needs a paid tier to be feasible at all.
 
 ### Remaining in Phase 2
 
