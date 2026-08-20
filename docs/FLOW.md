@@ -9,6 +9,7 @@ A module-by-module walkthrough of what was built, why, and how the pieces fit to
 - [Module 2 — The Data Model](#module-2--the-data-model)
 - [Module 3 — File Discovery & Chunking](#module-3--file-discovery--chunking)
 - [Module 4 — The LLM Core](#module-4--the-llm-core)
+- [Module 4a — Concurrency](#module-4a--concurrency)
 - [Module 5 — Reporting](#module-5--reporting)
 - [Module 5a — Baseline Suppression](#module-5a--baseline-suppression)
 - [Module 5b — Response Caching](#module-5b--response-caching)
@@ -55,7 +56,7 @@ llm-appsec-scanner/
 │   ├── baseline.py        cross-run suppression of accepted findings
 │   └── cache.py           content-addressed LLM response cache
 ├── tests/
-│   ├── test_scanner.py    110 tests, no network
+│   ├── test_scanner.py    119 tests, no network
 │   └── vulnerable_samples/
 ├── docs/
 │   ├── DESIGN.md          architecture and rationale
@@ -301,6 +302,42 @@ class LLMClient(Protocol):
 
 ---
 
+## Module 4a — Concurrency
+
+**Files:** [`scanner/core.py`](../scanner/core.py) — `Scanner.scan()` and `RateLimiter`
+
+`Scanner.scan()` submits files to a `ThreadPoolExecutor` (default 4 workers). Threads rather than asyncio, because the SDK call is blocking I/O and threads keep `LLMClient` an ordinary synchronous protocol.
+
+**One shared rate limiter.** Every worker calls the same `RateLimiter`, so `--rpm` stays the hard cap no matter how many workers run. Concurrency buys overlap of request *latency*, not extra request volume — which is why the speedup plateaus once the rate limit, rather than latency, becomes the binding constraint (measured numbers in [DESIGN.md 4.13](DESIGN.md#413-concurrent-scanning)).
+
+**The rate limiter was rewritten before concurrency could be added.** The original compared against `_last_call` and then slept:
+
+```python
+elapsed = now - self._last_call
+if elapsed < self._min_interval:
+    self._sleep(self._min_interval - elapsed)   # every thread sleeps the SAME amount
+self._last_call = time.monotonic()              # ...and only then updates
+```
+
+With one worker that is fine. With several, they all read the same `_last_call`, all compute the same wait, and all fire together. The replacement reserves a slot under a lock and waits outside it:
+
+```python
+with self._lock:
+    slot = now if self._next_slot is None else max(now, self._next_slot)
+    self._next_slot = slot + self._min_interval
+    wait = slot - now
+if wait > 0:
+    self._sleep(wait)     # each thread waits for its OWN slot
+```
+
+The regression test asserts the eight waits are *distinct*. Against the old code all eight are identical — the precise signature of the bug.
+
+**Determinism.** Workers write into a pre-sized list at their own index; the report is assembled by walking discovery order afterwards. A concurrent scan yields a byte-identical report to a serial one, which a test verifies directly.
+
+**Quota fail-fast, restated for concurrency.** Serially, "stopped at file N" implies N+1.. were untouched. Concurrently there is no clean boundary — file 8 can finish after file 7 hits the quota. So an unfilled slot means *never attempted*, a `threading.Event` stops workers that have not started, and the truncation message reports counts rather than a position. Files that already completed keep their results; discarding them would waste quota already spent.
+
+---
+
 ## Module 5 — Reporting
 
 **File:** [`scanner/reporter.py`](../scanner/reporter.py)
@@ -419,7 +456,7 @@ The `2`-vs-`1` split matters in CI: a pipeline can distinguish "the scanner foun
 
 ## Module 7 — Testing
 
-**File:** [`tests/test_scanner.py`](../tests/test_scanner.py) — 110 tests, no network, no API key.
+**File:** [`tests/test_scanner.py`](../tests/test_scanner.py) — 119 tests, no network, no API key.
 
 ### The `FakeClient`
 
@@ -572,6 +609,8 @@ for m in client.models.list():
 | Exit `2` immediately | Missing key, bad target, bad `--output` extension, or a truncated (quota-exhausted) scan | Read the stderr message — a truncated scan always exits `2`, even if findings exist in the files that did complete |
 | Scan is slow | Serial requests + RPM pacing | Narrow `--target`; concurrency is on the roadmap |
 | Line numbers look wrong | Reporting bug on a chunked file | Confirm the file is >400 lines; check `number_lines` offsets |
+| Progress lines appear out of order | Files are scanned in parallel (default 4 workers) | Expected. The *report* is always reassembled in discovery order; only live progress interleaves. `--concurrency 1` restores serial output |
+| Raising `--concurrency` does not speed anything up | The `--rpm` cap is the binding limit, not request latency | Expected below ~4 workers on a free tier. Raise `--rpm` too, or accept the plateau — see [DESIGN.md 4.13](DESIGN.md#413-concurrent-scanning) |
 | Scan returns instantly with no API calls | Every chunk was served from the response cache | Expected after an unchanged re-run. `--no-cache` forces a fresh scan; the `cache: N hit(s)` line reports it |
 | Results look stale after editing the system prompt | They are not — the prompt is part of the cache key, so tuning it invalidates every entry | If you suspect otherwise, confirm with `--no-cache`; a mismatch would be a bug worth reporting |
 | Cache directory appearing in odd places | `--cache-dir` is relative by default, so it lands in the current working directory | Pass an absolute `--cache-dir`, or run from the repo root. It is gitignored and safe to delete |

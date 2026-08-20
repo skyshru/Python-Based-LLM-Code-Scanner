@@ -7,7 +7,9 @@ import logging
 import os
 import random
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
@@ -31,6 +33,10 @@ from .models import (
     Severity,
     Vulnerability,
 )
+
+# Concurrency is bounded by the shared RateLimiter, so this mainly buys
+# overlap of per-request latency rather than extra request volume.
+DEFAULT_CONCURRENCY = 4
 
 SYSTEM_PROMPT = """\
 You are a senior application security engineer performing static analysis (SAST) \
@@ -164,22 +170,34 @@ class RateLimitConfig:
 
 
 class RateLimiter:
-    """Simple sleep-based pacer that keeps us under a per-minute quota."""
+    """Thread-safe pacer keeping the whole scan under a per-minute quota.
+
+    Each caller reserves the next free slot under a lock, then waits for
+    that slot *outside* the lock. Reservation is O(1), so concurrent
+    workers pace correctly as a group while still waiting in parallel.
+
+    The naive "compare against last call, then sleep" approach is unsafe
+    once there is more than one worker: several threads read the same
+    `_last_call`, all sleep the same amount, and all fire at once --
+    breaking the cap precisely when concurrency makes it matter.
+    """
 
     def __init__(self, requests_per_minute: int, sleep: Callable[[float], None] = time.sleep):
         self._min_interval = 60.0 / requests_per_minute if requests_per_minute > 0 else 0.0
         self._sleep = sleep
-        self._last_call: float | None = None
+        self._lock = threading.Lock()
+        self._next_slot: float | None = None
 
     def acquire(self) -> None:
         if self._min_interval <= 0:
             return
-        now = time.monotonic()
-        if self._last_call is not None:
-            elapsed = now - self._last_call
-            if elapsed < self._min_interval:
-                self._sleep(self._min_interval - elapsed)
-        self._last_call = time.monotonic()
+        with self._lock:
+            now = time.monotonic()
+            slot = now if self._next_slot is None else max(now, self._next_slot)
+            self._next_slot = slot + self._min_interval
+            wait = slot - now
+        if wait > 0:
+            self._sleep(wait)
 
 
 class GeminiClient:
@@ -379,11 +397,13 @@ class Scanner:
         model: str = DEFAULT_MODEL,
         severity_threshold: Severity = Severity.LOW,
         chunk_lines: int | None = None,
+        concurrency: int = DEFAULT_CONCURRENCY,
     ):
         self.client = client
         self.model = model
         self.severity_threshold = severity_threshold
         self.chunk_lines = chunk_lines
+        self.concurrency = max(1, concurrency)
 
     def scan_file(self, source: SourceFile) -> FileScanResult:
         chunks = chunk_file(
@@ -429,6 +449,7 @@ class Scanner:
     ) -> ScanReport:
         target_path = Path(target)
         paths = discover_files(target_path)
+        total = len(paths)
 
         report = ScanReport(
             model=self.model,
@@ -436,48 +457,86 @@ class Scanner:
             severity_threshold=self.severity_threshold,
         )
 
-        for i, path in enumerate(paths, start=1):
+        # A slot left as None means "never attempted", which is how a quota
+        # stop is represented regardless of worker completion order.
+        results: list[FileScanResult | None] = [None] * total
+        quota_stop = threading.Event()
+        quota_reason: list[str] = []
+        callback_lock = threading.Lock()
+
+        def work(index: int, path: Path) -> None:
+            if quota_stop.is_set():
+                return
+
             display = _display_path(path, target_path)
             if on_file_start:
-                on_file_start(display, i, len(paths))
+                with callback_lock:
+                    on_file_start(display, index + 1, total)
 
             try:
                 source = read_source_file(path, base=target_path)
             except UnreadableFileError as exc:
-                result = FileScanResult(
-                    file_path=display,
-                    scanned=False,
-                    error=str(exc),
-                )
+                result = FileScanResult(file_path=display, scanned=False, error=str(exc))
             else:
                 try:
                     result = self.scan_file(source)
                 except DailyQuotaExceededError as exc:
-                    # Every remaining file would fail identically, so mark
-                    # them all at once instead of retrying-then-failing each
-                    # one individually.
-                    remaining = paths[i - 1 :]
-                    report.truncated = True
-                    report.truncation_reason = (
-                        f"Stopped after {i - 1} of {len(paths)} files "
-                        f"({len(remaining)} not attempted): {exc}"
-                    )
-                    for skipped_path in remaining:
-                        skipped_result = FileScanResult(
-                            file_path=_display_path(skipped_path, target_path),
-                            scanned=False,
-                            error="skipped: daily API quota exhausted; scan stopped early",
-                        )
-                        report.results.append(skipped_result)
-                        if on_file_done:
-                            on_file_done(skipped_result)
+                    # Leave this slot unattempted and stop the rest: every
+                    # remaining file would fail identically.
+                    quota_stop.set()
+                    with callback_lock:
+                        if not quota_reason:
+                            quota_reason.append(str(exc))
+                    return
+
+            results[index] = result
+            if on_file_done:
+                with callback_lock:
+                    on_file_done(result)
+
+        if self.concurrency > 1 and total > 1:
+            with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+                futures = [pool.submit(work, i, p) for i, p in enumerate(paths)]
+                for future in futures:
+                    # Surfaces unexpected worker exceptions rather than
+                    # silently dropping a file's result.
+                    future.result()
+        else:
+            for index, path in enumerate(paths):
+                work(index, path)
+                if quota_stop.is_set():
                     break
 
+        # Assemble in discovery order, so the report is identical whatever
+        # order the workers happened to finish in.
+        attempted = 0
+        for index, path in enumerate(paths):
+            result = results[index]
+            if result is None:
+                result = FileScanResult(
+                    file_path=_display_path(path, target_path),
+                    scanned=False,
+                    error="skipped: daily API quota exhausted; scan stopped early",
+                )
+                report.truncated = True
+                # Fired here rather than in the worker: these files were
+                # never processed, so this is the only ordered point at
+                # which they can be reported.
+                if on_file_done:
+                    on_file_done(result)
+            else:
+                attempted += 1
             report.results.append(result)
-            if on_file_done:
-                on_file_done(result)
 
-        report.rebuild_summary(files_discovered=len(paths))
+        if report.truncated:
+            not_attempted = total - attempted
+            reason = quota_reason[0] if quota_reason else "daily API quota exhausted"
+            report.truncation_reason = (
+                f"Stopped after {attempted} of {total} files "
+                f"({not_attempted} not attempted): {reason}"
+            )
+
+        report.rebuild_summary(files_discovered=total)
         return report
 
 

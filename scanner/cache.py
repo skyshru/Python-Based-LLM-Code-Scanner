@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+import os
+import tempfile
+import threading
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,10 +32,23 @@ CACHE_FORMAT_VERSION = 1
 
 @dataclass
 class CacheStats:
-    """Per-run counters, surfaced by the CLI so quota saved is visible."""
+    """Per-run counters, surfaced by the CLI so quota saved is visible.
+
+    Guarded by a lock: `+= 1` is not atomic, so concurrent workers would
+    silently undercount without one.
+    """
 
     hits: int = 0
     misses: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def record_hit(self) -> None:
+        with self._lock:
+            self.hits += 1
+
+    def record_miss(self) -> None:
+        with self._lock:
+            self.misses += 1
 
     @property
     def total(self) -> int:
@@ -90,7 +106,22 @@ class ResponseCache:
         }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+            # Write-then-rename so a reader never observes a half-written
+            # entry. Two workers racing on the same key both write complete
+            # temp files and one rename wins -- the contents are identical,
+            # so either winner is correct.
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(record, handle, indent=2)
+                os.replace(tmp, path)
+            except BaseException:
+                # Never leave a stray temp file behind on failure.
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         except OSError:
             # An unwritable cache is a missed optimization, not a failure.
             pass
@@ -115,10 +146,10 @@ class CachingClient:
 
         cached = self.cache.get(key)
         if cached is not None:
-            self.stats.hits += 1
+            self.stats.record_hit()
             return cached
 
-        self.stats.misses += 1
+        self.stats.record_miss()
         # Only reached on a miss, and only cached on success: an exception
         # propagates uncached, so a quota failure or a malformed response
         # is never memoized as if it were a real answer.

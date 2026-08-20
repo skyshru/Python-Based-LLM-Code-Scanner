@@ -14,6 +14,7 @@ from .baseline import apply_baseline, load_baseline, save_baseline
 from .baseline import update_baseline as merge_baseline
 from .cache import DEFAULT_CACHE_DIR, CachingClient
 from .core import (
+    DEFAULT_CONCURRENCY,
     DEFAULT_MODEL,
     GeminiClient,
     RateLimitConfig,
@@ -84,6 +85,13 @@ def _has_supported_output_extension(path: Path) -> bool:
     help="Retries per request on quota or transient errors.",
 )
 @click.option(
+    "--concurrency",
+    type=int,
+    default=DEFAULT_CONCURRENCY,
+    show_default=True,
+    help="Files scanned in parallel. Total request rate stays bounded by --rpm.",
+)
+@click.option(
     "--chunk-lines",
     type=int,
     default=None,
@@ -135,6 +143,7 @@ def main(
     model: str | None,
     rpm: int,
     max_retries: int,
+    concurrency: int,
     chunk_lines: int | None,
     quiet: bool,
     no_fail: bool,
@@ -182,6 +191,7 @@ def main(
         model=model,
         severity_threshold=threshold,
         chunk_lines=chunk_lines,
+        concurrency=concurrency,
     )
 
     def on_file_start(path: str, index: int, total: int) -> None:

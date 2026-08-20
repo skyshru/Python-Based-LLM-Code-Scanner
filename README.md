@@ -32,6 +32,7 @@ This tool is designed to **complement** rule-based scanners (Semgrep, Bandit, tf
 | **Smart file filtering** | Skips `.git`, `node_modules`, `__pycache__`, `.venv`, lockfiles, binaries, oversized blobs |
 | **Chunking with overlap** | Large files are split into overlapping line windows so nothing straddles a boundary |
 | **Rate limiting + retry** | Client-side RPM pacing and exponential backoff with jitter on `429`/`5xx` |
+| **Concurrent scanning** | Files scanned in parallel against one shared rate limiter |
 | **Response caching** | Unchanged files are served from disk, so re-scans cost no API quota |
 | **Baseline suppression** | Accept known findings once; only new ones fail the build |
 | **Four output modes** | Colour-coded terminal, machine-readable JSON, shareable Markdown, SARIF for GitHub Code Scanning |
@@ -103,6 +104,7 @@ llm-appsec-scanner -t ./terraform -o security-report.md
 | `--model` | `gemini-3.7-flash` | Gemini model id. Falls back to `$LLM_APPSEC_MODEL`, then the built-in default |
 | `--rpm` | `15` | Client-side requests-per-minute cap |
 | `--max-retries` | `4` | Retries on quota/transient errors |
+| `--concurrency` | `4` | Files scanned in parallel; total request rate still bounded by `--rpm` |
 | `--chunk-lines` | auto | Lines per request for large files |
 | `--quiet`, `-q` | off | Summary table only |
 | `--no-fail` | off | Always exit `0` (report-only mode) |
@@ -110,6 +112,28 @@ llm-appsec-scanner -t ./terraform -o security-report.md
 | `--no-cache` | off | Re-query the model for every chunk, ignoring the cache |
 | `--baseline PATH` | — | Suppress findings already accepted in this baseline file |
 | `--update-baseline` | off | Fold every current finding into `--baseline` instead of suppressing; always exits `0` |
+
+### Concurrency
+
+Files are scanned in parallel (4 workers by default). All workers share **one** rate limiter, so raising concurrency never raises your request rate — `--rpm` remains the cap.
+
+```bash
+llm-appsec-scanner -t ./src --concurrency 8   # more overlap
+llm-appsec-scanner -t ./src --concurrency 1   # strictly serial
+```
+
+**How much this actually helps depends on which limit you are hitting**, and it is worth being precise rather than promising a blanket speedup. Simulated on 12 files with representative request latency:
+
+| Workers | Rate-limit-bound (low `--rpm`) | Latency-bound (high `--rpm`) |
+| --- | --- | --- |
+| 1 | baseline | baseline |
+| 2 | 1.8x | 2.0x |
+| 4 | 1.9x *(plateau)* | 3.7x |
+| 8 | 1.9x *(no further gain)* | 5.4x |
+
+On a free-tier key the RPM cap is the floor, so concurrency past ~2–4 buys nothing — the measured time matches the rate limiter's theoretical minimum almost exactly. Concurrency pays off properly once `--rpm` is raised, i.e. on a paid tier. The default of 4 sits at the plateau for slow tiers while leaving headroom for fast ones.
+
+Results are reassembled in discovery order, so a concurrent scan produces a byte-identical report to a serial one.
 
 ### Response caching
 
@@ -372,7 +396,7 @@ pytest -q -k reporter          # one area
 - [x] SARIF output for GitHub Code Scanning
 - [x] Baseline/suppression file to ignore accepted risks
 - [x] Response caching keyed on file content, to skip unchanged files
-- [ ] Concurrent file scanning with a shared rate limiter
+- [x] Concurrent file scanning with a shared rate limiter
 - [ ] Auto-fix mode that applies `code_patch` as a git diff
 
 ---

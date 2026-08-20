@@ -227,7 +227,7 @@ Nothing blocking. The prompt-validation item is resolved as far as the free tier
 ## Phase 3 — Scale & Performance 🟡 In Progress
 
 **Dates:** started 2026-08-17
-**Status:** 110/110 tests passing
+**Status:** 119/119 tests passing
 
 ### 3a. Response caching ✅
 
@@ -243,9 +243,31 @@ New module `scanner/cache.py`. Chosen as the first Phase 3 item because it needs
 - Covered by 12 new tests: hit/miss behavior, persistence across client instances, key invalidation for each of model/system-prompt/user-prompt independently, corrupt-entry and unwritable-directory degradation, failures not being cached, end-to-end reuse through `Scanner`, edited files correctly missing, and both CLI flags.
 - Full rationale in [DESIGN.md §4.12](DESIGN.md#412-response-caching); walkthrough in [FLOW.md Module 5b](FLOW.md#module-5b--response-caching).
 
+### 3b. Concurrent file scanning ✅
+
+`Scanner.scan()` now runs files through a `ThreadPoolExecutor`, default 4 workers, all sharing one `RateLimiter` so `--rpm` remains the hard cap. Threads rather than asyncio: the SDK call is blocking I/O, and threads keep `LLMClient` a plain synchronous protocol instead of forcing an async rewrite through client, scanner and CLI for no extra throughput.
+
+**A latent thread-safety bug had to be fixed first, and it was silent.** The existing `RateLimiter` compared against `_last_call` and *then* slept, updating the timestamp afterwards. Single-threaded that is correct; with several workers they all read the same timestamp, all compute the same wait, and all fire simultaneously — breaking the RPM cap precisely when concurrency makes it matter. Replaced with slot reservation: reserve under a lock, wait outside it, so reservations serialize while waiting overlaps. The regression test asserts the eight recorded waits are *distinct*; replaying it against the old implementation yields **one** distinct value across all eight threads, which is exactly the failure signature — verified before trusting the test.
+
+**Two more shared-state hazards, both introduced by yesterday's cache and fixed here:** `CacheStats` counters (`+= 1` is not atomic, so concurrent workers would silently undercount — now locked) and cache writes (two workers racing on one key — now write-to-temp plus `os.replace`, so a reader never observes a half-written entry, and either winner is correct since the contents are identical).
+
+**Measured speedup, stated with its caveat rather than as a headline number.** Simulated over 12 files with representative latency and a real `RateLimiter`:
+
+| Workers | Rate-limit-bound (low `--rpm`) | Latency-bound (high `--rpm`) |
+| --- | --- | --- |
+| 2 | 1.8x | 2.0x |
+| 4 | 1.9x **(plateau)** | 3.7x |
+| 8 | 1.9x (no further gain) | 5.4x |
+
+At low RPM the wall time matches the limiter's theoretical floor almost exactly, so extra workers do nothing — **on a free-tier key this is roughly a 1.9x win, not a 5x one.** Concurrency scales properly only once `--rpm` stops binding, i.e. on a paid tier. Default 4 sits at the plateau for slow tiers with headroom for fast ones.
+
+**Determinism and quota fail-fast both preserved.** Workers write into a pre-sized list at their own index and the report is assembled in discovery order, so a concurrent scan yields a byte-identical report to a serial one (verified by a test running both). Quota fail-fast needed its semantics restated: concurrently there is no clean "stopped at file N" boundary, since file 8 can finish after file 7 hits the quota. An unfilled slot now means *never attempted*, a `threading.Event` stops workers that have not started, and the truncation message reports counts rather than a position. Files that already completed keep their results — discarding them would waste quota already spent.
+
+- 9 new tests: observable overlap, strict serialism at `--concurrency 1`, concurrent-vs-serial report equality, quota stop under concurrency, workers not firing after a quota stop, rate-limiter thread safety, zero-RPM bypass, and both CLI flags. Two existing test helpers were made thread-safe, since their unguarded `+= 1` would otherwise have made the new tests flaky.
+- Rationale in [DESIGN.md 4.13](DESIGN.md#413-concurrent-scanning); walkthrough in [FLOW.md Module 4a](FLOW.md#module-4a--concurrency).
+
 ### Remaining in Phase 3
 
-- Concurrent file scanning sharing one `RateLimiter` — the largest remaining win; serial scanning is the reason a 78-file repo is currently impractical.
 - Git-diff mode (`--changed-only`) for fast PR scans. Composes well with 3a: caching already makes unchanged files cheap, and this would avoid even discovering them.
 - Repository context pass to enable cross-file reasoning — the hardest item, and the one that addresses the per-file-context limitation carried since Phase 1.
 

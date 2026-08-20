@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -104,9 +106,13 @@ class QuotaExhaustedClient:
         self._responses = responses
         self._fail_after = fail_after
         self.calls = 0
+        # `+= 1` is not atomic; without this the counter races under
+        # concurrent scanning and the test becomes flaky.
+        self._lock = threading.Lock()
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
-        self.calls += 1
+        with self._lock:
+            self.calls += 1
         if self.calls > self._fail_after:
             raise DailyQuotaExceededError(
                 "Daily request quota exhausted for model 'x': 429 RESOURCE_EXHAUSTED "
@@ -908,6 +914,135 @@ def test_render_sarif_marks_suppressed_results():
 
 
 # --------------------------------------------------------------------------
+# concurrency
+# --------------------------------------------------------------------------
+
+
+class ConcurrencyProbeClient:
+    """Records how many calls are in flight simultaneously."""
+
+    def __init__(self, hold_seconds: float = 0.05):
+        self.hold = hold_seconds
+        self.calls = 0
+        self.max_in_flight = 0
+        self._in_flight = 0
+        self._lock = threading.Lock()
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        with self._lock:
+            self.calls += 1
+            self._in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self._in_flight)
+        try:
+            time.sleep(self.hold)
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+        return '{"vulnerabilities": []}'
+
+
+def _make_files(tmp_path: Path, count: int) -> None:
+    for i in range(count):
+        (tmp_path / f"f{i}.py").write_text(f"x = {i}" + chr(10))
+
+
+def test_concurrent_scan_actually_overlaps(tmp_path: Path):
+    _make_files(tmp_path, 6)
+    client = ConcurrencyProbeClient()
+
+    Scanner(client, concurrency=4).scan(tmp_path)
+
+    assert client.calls == 6
+    assert client.max_in_flight > 1, "concurrency=4 should overlap requests"
+
+
+def test_concurrency_one_is_strictly_serial(tmp_path: Path):
+    _make_files(tmp_path, 4)
+    client = ConcurrencyProbeClient()
+
+    Scanner(client, concurrency=1).scan(tmp_path)
+
+    assert client.max_in_flight == 1, "concurrency=1 must never overlap"
+
+
+def test_concurrent_and_serial_reports_are_identical(tmp_path: Path):
+    """Workers finish out of order, so the report must be reassembled in
+    discovery order or results would shuffle between runs."""
+    _make_files(tmp_path, 8)
+    payload = json.dumps({"vulnerabilities": [_finding()]})
+
+    serial = Scanner(FakeClient(payload), concurrency=1).scan(tmp_path)
+    concurrent = Scanner(FakeClient(payload), concurrency=8).scan(tmp_path)
+
+    assert [r.file_path for r in serial.results] == [r.file_path for r in concurrent.results]
+    assert serial.summary.total_findings == concurrent.summary.total_findings
+
+
+def test_concurrent_scan_stops_on_daily_quota(tmp_path: Path):
+    _make_files(tmp_path, 6)
+    client = QuotaExhaustedClient(
+        responses=[json.dumps({"vulnerabilities": []})],
+        fail_after=1,
+    )
+
+    report = Scanner(client, concurrency=4).scan(tmp_path)
+
+    assert report.truncated is True
+    assert "not attempted" in report.truncation_reason
+    skipped = [r for r in report.results if r.error and "quota exhausted" in r.error]
+    assert skipped, "quota stop must mark unattempted files as skipped"
+    assert len(report.results) == 6, "every discovered file must appear in the report"
+
+
+def test_concurrent_quota_stop_does_not_keep_calling_the_model(tmp_path: Path):
+    """The point of failing fast: workers that have not started must not
+    fire once the quota is known to be gone."""
+    _make_files(tmp_path, 40)
+    client = QuotaExhaustedClient(responses=[], fail_after=0)
+
+    Scanner(client, concurrency=4).scan(tmp_path)
+
+    assert client.calls < 40, "should stop early rather than attempt every file"
+
+
+def test_rate_limiter_is_thread_safe(monkeypatch):
+    """The old implementation let N threads read the same `_last_call`,
+    sleep the same amount, and fire together -- breaking the RPM cap
+    exactly when concurrency made it matter."""
+    from scanner.core import RateLimiter
+
+    waits: list[float] = []
+    waits_lock = threading.Lock()
+
+    def record(seconds: float) -> None:
+        with waits_lock:
+            waits.append(seconds)
+
+    limiter = RateLimiter(requests_per_minute=60, sleep=record)  # 1s interval
+
+    threads = [threading.Thread(target=limiter.acquire) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Eight callers, one free slot: seven must have been told to wait, and
+    # their waits must be spread across distinct slots rather than equal.
+    assert len(waits) == 7
+    assert len(set(round(w, 3) for w in waits)) == 7, "waits must be distinct slots"
+
+
+def test_rate_limiter_disabled_when_rpm_is_zero():
+    from scanner.core import RateLimiter
+
+    waits: list[float] = []
+    limiter = RateLimiter(requests_per_minute=0, sleep=waits.append)
+    limiter.acquire()
+    limiter.acquire()
+    assert waits == []
+
+
+# --------------------------------------------------------------------------
 # response cache
 # --------------------------------------------------------------------------
 
@@ -918,9 +1053,11 @@ class CountingClient:
     def __init__(self, response: str = '{"vulnerabilities": []}'):
         self.response = response
         self.calls = 0
+        self._lock = threading.Lock()
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
-        self.calls += 1
+        with self._lock:
+            self.calls += 1
         return self.response
 
 
@@ -1347,6 +1484,46 @@ def test_cli_baseline_still_fails_on_genuinely_new_finding(tmp_path: Path, monke
         cli_module.main, ["--target", str(src), "--baseline", str(baseline_path)]
     )
     assert result.exit_code == 1  # different CWE at a different line: not the accepted finding
+
+
+def test_cli_concurrency_flag_is_passed_through(tmp_path: Path, monkeypatch):
+    from click.testing import CliRunner
+
+    from scanner import cli as cli_module
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _make_files(src, 5)
+
+    probe = ConcurrencyProbeClient()
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(cli_module, "GeminiClient", lambda **kw: probe)
+
+    CliRunner().invoke(
+        cli_module.main,
+        ["--target", str(src), "--concurrency", "4", "--no-cache"],
+    )
+    assert probe.max_in_flight > 1
+
+
+def test_cli_concurrency_one_stays_serial(tmp_path: Path, monkeypatch):
+    from click.testing import CliRunner
+
+    from scanner import cli as cli_module
+
+    src = tmp_path / "src"
+    src.mkdir()
+    _make_files(src, 4)
+
+    probe = ConcurrencyProbeClient()
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(cli_module, "GeminiClient", lambda **kw: probe)
+
+    CliRunner().invoke(
+        cli_module.main,
+        ["--target", str(src), "--concurrency", "1", "--no-cache"],
+    )
+    assert probe.max_in_flight == 1
 
 
 def test_cli_no_cache_flag_bypasses_the_cache(tmp_path: Path, monkeypatch):

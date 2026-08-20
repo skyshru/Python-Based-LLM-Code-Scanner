@@ -240,6 +240,28 @@ A fourth `reporter.py` format alongside terminal/JSON/Markdown, targeting [SARIF
 
 **Testing note.** The default cache directory is *relative*, so the test suite runs each test in an isolated working directory (an autouse fixture). Without it, tests scanning identical trivial content produce identical cache keys and leak findings into each other's supposedly-clean scans — which is exactly what happened when this was first wired up, and is worth knowing about before changing the default.
 
+### 4.13 Concurrent scanning
+
+`Scanner.scan()` runs files through a `ThreadPoolExecutor` (default 4 workers). Threads, not asyncio: the SDK call is blocking I/O, and threads keep `LLMClient` a plain synchronous protocol — an async variant would have forced an async protocol, an async client, and an async `Scanner` for no additional throughput.
+
+**Concurrency does not raise the request rate.** All workers share one `RateLimiter`, so `--rpm` remains the hard cap. What concurrency buys is *overlap of per-request latency*, which is why the benefit is bounded by whichever limit binds first:
+
+| Workers | Rate-limit-bound | Latency-bound |
+| --- | --- | --- |
+| 2 | 1.8x | 2.0x |
+| 4 | 1.9x (plateau) | 3.7x |
+| 8 | 1.9x | 5.4x |
+
+At low RPM the measured wall time matches the limiter's theoretical floor almost exactly, so extra workers do nothing. Default 4 sits at that plateau while leaving headroom for a raised `--rpm`.
+
+**The rate limiter had to be rewritten to be thread-safe first**, and the original bug is worth recording because it was silent. The old implementation compared against `_last_call` and *then* slept, so N threads could read the same timestamp, sleep the same duration, and fire simultaneously — breaking the cap precisely when concurrency made it matter. The replacement reserves a slot under a lock and waits for it outside the lock: reservations serialize, waiting overlaps. A regression test asserts the waits are *distinct*; against the old code all eight threads receive an identical wait, which is exactly the failure signature.
+
+**Determinism is preserved by construction.** Workers write into a pre-sized `results` list at their own index, and the report is assembled by walking `paths` in discovery order afterwards. A concurrent scan therefore produces a byte-identical report to a serial one — verified by a test that runs both and compares.
+
+**Quota fail-fast survives concurrency**, but its semantics needed restating. Serially, "stopped at file N" cleanly implies files N+1.. were untouched. Concurrently there is no such boundary: file 8 may finish after file 7 hit the quota. So a slot left as `None` means *never attempted*, a `threading.Event` stops workers that have not yet begun, and the truncation message reports counts (`attempted` vs `not attempted`) rather than a position. Files that did complete keep their results — discarding them would waste quota already spent.
+
+**Shared-state audit.** Concurrency turned three previously-safe things into hazards, all fixed here: `RateLimiter` (above), `CacheStats` counters (`+= 1` is not atomic — now locked), and cache writes (two workers racing on one key — now write-to-temp plus `os.replace`, so a reader never sees a half-written entry and either winner is correct since the contents are identical).
+
 ---
 
 ## 5. Data Model
