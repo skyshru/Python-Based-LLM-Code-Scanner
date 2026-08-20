@@ -147,6 +147,10 @@ class ScanSummary(BaseModel):
         default=0,
         description="Findings that matched a --baseline entry, excluded from total_findings.",
     )
+    generated_files_skipped: int = Field(
+        default=0,
+        description="Machine-generated files excluded from the scan (see --include-generated).",
+    )
 
 
 class ScanReport(BaseModel):
@@ -185,7 +189,16 @@ class ScanReport(BaseModel):
     def has_actionable_findings(self) -> bool:
         return self.summary.total_findings > 0
 
-    def rebuild_summary(self, files_discovered: int | None = None) -> None:
+    def rebuild_summary(
+        self,
+        files_discovered: int | None = None,
+        generated_files_skipped: int | None = None,
+    ) -> None:
+        # None means 'keep whatever the scan recorded'. Callers that
+        # rebuild later (e.g. after baseline suppression) must not
+        # silently zero a count they know nothing about.
+        if generated_files_skipped is None:
+            generated_files_skipped = self.summary.generated_files_skipped
         active = self.active_findings
         suppressed_count = len(self.findings) - len(active)
         by_severity: dict[str, int] = {s.value: 0 for s in Severity}
@@ -202,4 +215,5 @@ class ScanReport(BaseModel):
             total_findings=len(active),
             findings_by_severity=by_severity,
             suppressed_findings=suppressed_count,
+            generated_files_skipped=generated_files_skipped,
         )

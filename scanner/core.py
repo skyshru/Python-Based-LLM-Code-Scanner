@@ -21,7 +21,7 @@ from .file_handler import (
     SourceFile,
     UnreadableFileError,
     chunk_file,
-    discover_files,
+    discover_files_detailed,
     number_lines,
     read_source_file,
 )
@@ -398,12 +398,14 @@ class Scanner:
         severity_threshold: Severity = Severity.LOW,
         chunk_lines: int | None = None,
         concurrency: int = DEFAULT_CONCURRENCY,
+        include_generated: bool = False,
     ):
         self.client = client
         self.model = model
         self.severity_threshold = severity_threshold
         self.chunk_lines = chunk_lines
         self.concurrency = max(1, concurrency)
+        self.include_generated = include_generated
 
     def scan_file(self, source: SourceFile) -> FileScanResult:
         chunks = chunk_file(
@@ -448,7 +450,10 @@ class Scanner:
         on_file_done: Callable[[FileScanResult], None] | None = None,
     ) -> ScanReport:
         target_path = Path(target)
-        paths = discover_files(target_path)
+        paths, generated = discover_files_detailed(target_path)
+        if self.include_generated:
+            paths = sorted(paths + generated)
+            generated = []
         total = len(paths)
 
         report = ScanReport(
@@ -536,7 +541,10 @@ class Scanner:
                 f"({not_attempted} not attempted): {reason}"
             )
 
-        report.rebuild_summary(files_discovered=total)
+        report.rebuild_summary(
+            files_discovered=total,
+            generated_files_skipped=len(generated),
+        )
         return report
 
 

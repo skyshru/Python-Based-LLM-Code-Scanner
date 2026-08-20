@@ -109,6 +109,11 @@ def _has_supported_output_extension(path: Path) -> bool:
     help="Always exit 0, even when findings exist.",
 )
 @click.option(
+    "--include-generated",
+    is_flag=True,
+    help="Also scan machine-generated files (protobuf stubs, codegen output).",
+)
+@click.option(
     "--cache-dir",
     type=click.Path(path_type=Path),
     default=DEFAULT_CACHE_DIR,
@@ -147,6 +152,7 @@ def main(
     chunk_lines: int | None,
     quiet: bool,
     no_fail: bool,
+    include_generated: bool,
     cache_dir: Path,
     no_cache: bool,
     baseline_path: Path | None,
@@ -192,6 +198,7 @@ def main(
         severity_threshold=threshold,
         chunk_lines=chunk_lines,
         concurrency=concurrency,
+        include_generated=include_generated,
     )
 
     def on_file_start(path: str, index: int, total: int) -> None:
@@ -221,6 +228,12 @@ def main(
 
     if report.summary.files_discovered == 0:
         console.print("[yellow]No supported source files found under the target.[/yellow]")
+
+    if report.summary.generated_files_skipped:
+        console.print(
+            f"[dim]{report.summary.generated_files_skipped} generated file(s) skipped "
+            "(--include-generated to scan them)[/dim]"
+        )
 
     if caching_client and caching_client.stats.total:
         stats = caching_client.stats

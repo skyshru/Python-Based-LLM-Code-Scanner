@@ -262,6 +262,23 @@ At low RPM the measured wall time matches the limiter's theoretical floor almost
 
 **Shared-state audit.** Concurrency turned three previously-safe things into hazards, all fixed here: `RateLimiter` (above), `CacheStats` counters (`+= 1` is not atomic — now locked), and cache writes (two workers racing on one key — now write-to-temp plus `os.replace`, so a reader never sees a half-written entry and either winner is correct since the contents are identical).
 
+### 4.14 Generated-code exclusion
+
+Machine-generated files are excluded from discovery by default. The motivation is concrete rather than theoretical: on Tesla's `vehicle-command` repo, **9 generated protobuf files accounted for 45 of 161 requests — 28% of the entire scan cost across 8% of the files.**
+
+Two reasons to skip them, and the second is the one that matters:
+
+1. **Findings there are unactionable.** Nobody edits generated code; a fix would be overwritten by the next `protoc` run. The real fix always belongs in the generator or the `.proto`.
+2. **On a metered API it is wasted spend.** At a free-tier 20 requests/day, those 45 requests are more than two full days buying nothing.
+
+**Two detection signals, cheapest first.** Filename suffixes (`.pb.go`, `_pb2.py`, `.g.dart`, …) need no file read. Content markers are the authoritative, language-agnostic check — Go standardises `Code generated ... DO NOT EDIT.`, and GitHub's linguist recognises `@generated`. Only the first 20 lines are examined: generators put their banner at the very top, and reading further would start matching ordinary prose *about* generated code.
+
+**Explicitly named files are always honoured.** `--target ./api.pb.go` scans it. Silently reporting "no supported files found" for a file the user named by hand would be more confusing than obeying them; the exclusion exists to stop wasteful *discovery*, not to override an explicit instruction.
+
+**Test files are deliberately not excluded**, even though they were another 23% of that repo's cost. Test fixtures are a well-known place for real credentials to leak, so those findings have genuine value — unlike generated code, where they have none. Cost alone was not sufficient justification.
+
+**The count is surfaced, not silent.** `ScanSummary.generated_files_skipped` appears in every output format, so a user always knows why coverage differs from their file count. Note that `rebuild_summary()` preserves this value when called without it: the CLI rebuilds the summary again after baseline processing, and a naive default of `0` would have silently zeroed a count that call site knows nothing about.
+
 ---
 
 ## 5. Data Model
