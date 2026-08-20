@@ -11,6 +11,7 @@ A module-by-module walkthrough of what was built, why, and how the pieces fit to
 - [Module 4 — The LLM Core](#module-4--the-llm-core)
 - [Module 5 — Reporting](#module-5--reporting)
 - [Module 5a — Baseline Suppression](#module-5a--baseline-suppression)
+- [Module 5b — Response Caching](#module-5b--response-caching)
 - [Module 6 — The CLI](#module-6--the-cli)
 - [Module 7 — Testing](#module-7--testing)
 - [Module 8 — End-to-End Trace](#module-8--end-to-end-trace)
@@ -51,9 +52,10 @@ llm-appsec-scanner/
 │   ├── models.py          Pydantic schemas
 │   ├── file_handler.py    traversal, filtering, chunking
 │   ├── reporter.py        JSON / Markdown / SARIF / terminal
-│   └── baseline.py        cross-run suppression of accepted findings
+│   ├── baseline.py        cross-run suppression of accepted findings
+│   └── cache.py           content-addressed LLM response cache
 ├── tests/
-│   ├── test_scanner.py    97 tests, no network
+│   ├── test_scanner.py    110 tests, no network
 │   └── vulnerable_samples/
 ├── docs/
 │   ├── DESIGN.md          architecture and rationale
@@ -345,6 +347,38 @@ update_baseline(existing, findings)  folds current findings into a Baseline, add
 
 ---
 
+## Module 5b — Response Caching
+
+**File:** [`scanner/cache.py`](../scanner/cache.py)
+
+Re-scanning a repo where two files changed should not re-pay for the other forty. On a free-tier key capped at ~20 requests/day — where a single large file consumes several, because it is chunked — that is the difference between a usable tool and one you can run twice.
+
+```
+CachingClient(inner, model, cache_dir)     decorates any LLMClient
+├── ResponseCache                          key -> response, one JSON file per entry
+│   ├── key_for(model, system, user)       sha256 over everything that changes the answer
+│   ├── get(key)                           corrupt/missing entry -> None (a miss)
+│   └── put(key, response, model)          unwritable dir -> silently skipped
+└── CacheStats                             hits / misses, surfaced by the CLI
+```
+
+**Why a decorator and not a change to `GeminiClient`.** `CachingClient` implements the same `generate(system_prompt, user_prompt) -> str` protocol from Module 4, so `Scanner` needed no changes at all and tests can wrap a fake. It also sits *outside* the rate limiter, which lives inside `GeminiClient` — so a cache hit costs neither quota nor the RPM pacing sleep. Embedding the cache inside `GeminiClient` would have made every hit wait out the rate-limit interval for nothing.
+
+**What goes into the key**, and why each part is load-bearing:
+
+| Component | Why |
+| --- | --- |
+| `user_prompt` | Already contains file path, language, chunk boundaries and the numbered source — so content edits *and* chunking changes are covered with no extra bookkeeping |
+| `system_prompt` | The prompt was retuned mid-project. A cache blind to that would have served pre-tuning results while we believed we were measuring the new prompt — a real correctness bug, not a hypothetical |
+| `model` | The same prompts produce measurably different findings on different models; that difference *is* the Phase 2 result |
+| `CACHE_FORMAT_VERSION` | Bumping it invalidates every entry at once, rather than risking a stale read against a changed record shape |
+
+**Failure handling is deliberately one-directional: a broken cache may never break a scan.** `put()` runs only after `inner.generate()` returns, so exceptions propagate uncached — a quota error or malformed response is never memoized as if it were an answer. A corrupt entry degrades to a miss. An unwritable directory is swallowed. The worst case is that caching does nothing, never that the scan fails.
+
+**Gotcha worth knowing.** `--cache-dir` defaults to a *relative* path, so the cache lands beside wherever you run the tool. The test suite therefore runs each test in an isolated working directory via an autouse fixture — without it, two tests scanning identical trivial content generate identical keys and one test's findings leak into another's supposedly-clean scan. That is not hypothetical; it happened the first time this was wired up, and three CLI tests failed because of it.
+
+---
+
 ## Module 6 — The CLI
 
 **File:** [`scanner/cli.py`](../scanner/cli.py)
@@ -385,7 +419,7 @@ The `2`-vs-`1` split matters in CI: a pipeline can distinguish "the scanner foun
 
 ## Module 7 — Testing
 
-**File:** [`tests/test_scanner.py`](../tests/test_scanner.py) — 97 tests, no network, no API key.
+**File:** [`tests/test_scanner.py`](../tests/test_scanner.py) — 110 tests, no network, no API key.
 
 ### The `FakeClient`
 
@@ -538,6 +572,9 @@ for m in client.models.list():
 | Exit `2` immediately | Missing key, bad target, bad `--output` extension, or a truncated (quota-exhausted) scan | Read the stderr message — a truncated scan always exits `2`, even if findings exist in the files that did complete |
 | Scan is slow | Serial requests + RPM pacing | Narrow `--target`; concurrency is on the roadmap |
 | Line numbers look wrong | Reporting bug on a chunked file | Confirm the file is >400 lines; check `number_lines` offsets |
+| Scan returns instantly with no API calls | Every chunk was served from the response cache | Expected after an unchanged re-run. `--no-cache` forces a fresh scan; the `cache: N hit(s)` line reports it |
+| Results look stale after editing the system prompt | They are not — the prompt is part of the cache key, so tuning it invalidates every entry | If you suspect otherwise, confirm with `--no-cache`; a mismatch would be a bug worth reporting |
+| Cache directory appearing in odd places | `--cache-dir` is relative by default, so it lands in the current working directory | Pass an absolute `--cache-dir`, or run from the repo root. It is gitignored and safe to delete |
 | `error: --update-baseline requires --baseline PATH` | Passed `--update-baseline` alone | Add `--baseline PATH`; the two flags always go together |
 | A finding that should be new got silently suppressed | Baseline's fuzzy line-range tolerance (`LINE_TOLERANCE = 3`) matched a *different* finding of the same CWE nearby | Known, accepted tradeoff — see [DESIGN.md §4.11](DESIGN.md#411-baseline-suppression). Remove the offending entry from the baseline file by hand if it's too coarse for that spot |
 | A finding you expected to be suppressed still fails the build | `file_path` or `cwe_id` didn't match exactly (baseline never matches on title) | Confirm the baseline entry's `file_path`/`cwe_id` against the new finding; re-run `--update-baseline` to accept it if it's genuinely the same issue |

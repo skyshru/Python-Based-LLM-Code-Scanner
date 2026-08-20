@@ -1,7 +1,7 @@
 # Design Document — llm-appsec-scanner
 
 **Status:** Living document · updated as the system evolves
-**Last updated:** Phase 1 (2026-08-15)
+**Last updated:** Phase 3 (2026-08-17)
 
 ---
 
@@ -43,16 +43,23 @@ scanner/
 ├── file_handler.py  Filesystem → SourceFile → CodeChunk.         No LLM knowledge.
 ├── core.py          Prompting, LLM transport, orchestration.     No I/O formatting.
 ├── models.py        Schemas, validation, severity semantics.     No dependencies on siblings.
-└── reporter.py      ScanReport → terminal / JSON / Markdown.     Read-only over models.
+├── reporter.py      ScanReport → terminal / JSON / MD / SARIF.   Read-only over models.
+├── baseline.py      Cross-run suppression of accepted findings.  Policy over models.
+└── cache.py         Content-addressed LLMClient decorator.       Wraps, never modifies.
 ```
 
 The dependency graph is strictly acyclic and points inward toward `models.py`:
 
 ```
 cli ──▶ core ──▶ file_handler ──▶ models
- │        │                          ▲
- └────────┴──────▶ reporter ─────────┘
+ │        ▲                          ▲
+ │        │                          │
+ ├──▶ cache (decorates LLMClient) ───┤
+ ├──▶ baseline ──────────────────────┤
+ └──▶ reporter ──────────────────────┘
 ```
+
+`cache.py` imports `core` only for the `LLMClient` type; `core` never imports `cache`, so the cycle is avoided and `cli` does the wiring.
 
 This means `models.py` can be imported by anything (including downstream consumers of the JSON schema) without pulling in `google-genai`, `click`, or `rich`.
 
@@ -214,6 +221,24 @@ A fourth `reporter.py` format alongside terminal/JSON/Markdown, targeting [SARIF
 **`--update-baseline` is additive and idempotent by construction**, not by a separate dedup pass bolted on afterward: `update_baseline()` checks each new finding against existing entries using the *same* fuzzy-match tolerance before appending, so re-running it against unchanged code never grows the file. This also means the acceptance workflow and the suppression workflow share one matching definition — there is no way for "what update_baseline just wrote" and "what apply_baseline will later match" to drift apart, because they're the same function.
 
 **Why not reuse the SARIF fingerprint here?** It was tried first, conceptually — reuse would have been simpler. It doesn't work: the fingerprint's inclusion of `title` is exactly the property this feature needs to *not* match on, per the grounding above. Sharing it would have meant either weakening the SARIF fingerprint (worse for GitHub's own alert tracking) or accepting the same under-matching problem that motivated building this in the first place.
+
+### 4.12 Response caching
+
+`scanner/cache.py`. Re-scanning a repo where two files changed should not re-pay for the other forty.
+
+**A decorator over `LLMClient`, not logic inside `GeminiClient`.** `CachingClient` implements the same two-method protocol from §4.6 and wraps any client. `Scanner` is completely unchanged; tests wrap a fake; a future non-Gemini backend inherits caching for free. It also puts the cache *outside* the rate limiter — which lives inside `GeminiClient` — so a cache hit costs neither quota nor pacing delay. Had the cache been embedded in `GeminiClient`, every hit would still have waited out the RPM interval for no reason.
+
+**The key is a hash of everything that can change the answer:** `(cache_format_version, model, system_prompt, user_prompt)`.
+
+- `user_prompt` already encodes file path, language, chunk boundaries *and* the numbered source, so hashing it covers both content edits and chunking changes without any extra bookkeeping.
+- `system_prompt` is included because omitting it would be a genuine correctness bug in this project specifically: the prompt was retuned mid-project (§2f/2j in the phase log), and a cache blind to that would have silently served pre-tuning results while we believed we were measuring the new prompt.
+- `model` is included because the same prompts demonstrably produce different findings on different models — that difference *is* the Phase 2 result.
+
+**Caching is on by default**, which is a deliberate call for a security tool. It's defensible because the key is content-addressed: a hit can only occur when the file, the prompt, and the model are all byte-identical to a previous run, in which case a fresh query would be answering the same question. That makes runs *more* reproducible, not less — a real benefit given model non-determinism. The residual risk is that a provider silently improves a model behind a stable id, which the cache would hide; `--no-cache` exists for that, and the cache directory is disposable.
+
+**Failures are never cached.** The `put()` happens only after `inner.generate()` returns, so an exception — a quota error, a malformed response — propagates uncached rather than being memoized as though it were a real answer. Similarly, a corrupt or unreadable cache entry degrades to a miss, and an unwritable cache directory is swallowed: a broken cache must never break a scan, only fail to accelerate it.
+
+**Testing note.** The default cache directory is *relative*, so the test suite runs each test in an isolated working directory (an autouse fixture). Without it, tests scanning identical trivial content produce identical cache keys and leak findings into each other's supposedly-clean scans — which is exactly what happened when this was first wired up, and is worth knowing about before changing the default.
 
 ---
 

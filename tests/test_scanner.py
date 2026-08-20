@@ -29,6 +29,7 @@ from scanner.file_handler import (
     read_source_file,
     SourceFile,
 )
+from scanner.cache import CachingClient, ResponseCache
 from scanner.baseline import (
     Baseline,
     BaselineEntry,
@@ -48,6 +49,19 @@ from scanner.reporter import (
 )
 
 SAMPLES = Path(__file__).parent / "vulnerable_samples"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cwd(tmp_path_factory, monkeypatch):
+    """Run every test in a throwaway directory.
+
+    The CLI's --cache-dir defaults to a *relative* path, so without this the
+    response cache lands in the repo root and, worse, leaks between tests:
+    two tests scanning identical trivial content produce identical cache
+    keys, so one test's findings surface in another's "clean" scan.
+    """
+    monkeypatch.chdir(tmp_path_factory.mktemp("cwd"))
+
 
 
 def _finding(severity: str = "HIGH", vid: str = "SEC-001", line: str = "18-20") -> dict:
@@ -894,6 +908,158 @@ def test_render_sarif_marks_suppressed_results():
 
 
 # --------------------------------------------------------------------------
+# response cache
+# --------------------------------------------------------------------------
+
+
+class CountingClient:
+    """Counts calls so cache hits are observable."""
+
+    def __init__(self, response: str = '{"vulnerabilities": []}'):
+        self.response = response
+        self.calls = 0
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        self.calls += 1
+        return self.response
+
+
+def test_cache_miss_then_hit(tmp_path: Path):
+    inner = CountingClient()
+    client = CachingClient(inner, model="m", cache_dir=tmp_path)
+
+    first = client.generate("sys", "user")
+    second = client.generate("sys", "user")
+
+    assert first == second
+    assert inner.calls == 1, "second identical prompt must not reach the model"
+    assert client.stats.hits == 1
+    assert client.stats.misses == 1
+
+
+def test_cache_persists_across_client_instances(tmp_path: Path):
+    """A cache that only worked in-process would save nothing on a re-run,
+    which is the entire point of the feature."""
+    first_inner = CountingClient()
+    CachingClient(first_inner, model="m", cache_dir=tmp_path).generate("sys", "user")
+
+    second_inner = CountingClient()
+    second = CachingClient(second_inner, model="m", cache_dir=tmp_path)
+    second.generate("sys", "user")
+
+    assert second_inner.calls == 0
+    assert second.stats.hits == 1
+
+
+@pytest.mark.parametrize(
+    "model, system_prompt, user_prompt",
+    [
+        ("different-model", "sys", "user"),
+        ("m", "a DIFFERENT system prompt", "user"),
+        ("m", "sys", "a different user prompt"),
+    ],
+    ids=["model changed", "system prompt changed", "user prompt changed"],
+)
+def test_cache_key_changes_when_any_input_changes(tmp_path: Path, model, system_prompt, user_prompt):
+    cache = ResponseCache(tmp_path)
+    baseline_key = cache.key_for("m", "sys", "user")
+    assert cache.key_for(model, system_prompt, user_prompt) != baseline_key
+
+
+def test_tuning_the_system_prompt_invalidates_the_cache(tmp_path: Path):
+    """Guards a real hazard: the system prompt was retuned mid-project, and
+    silently serving pre-tuning results would have hidden the change."""
+    inner = CountingClient()
+    old = CachingClient(inner, model="m", cache_dir=tmp_path)
+    old.generate("old prompt rules", "user")
+    assert inner.calls == 1
+
+    new = CachingClient(inner, model="m", cache_dir=tmp_path)
+    new.generate("new tuned prompt rules", "user")
+    assert inner.calls == 2, "a changed system prompt must re-query, not reuse"
+    assert new.stats.hits == 0
+
+
+def test_corrupt_cache_entry_degrades_to_a_miss(tmp_path: Path):
+    inner = CountingClient()
+    client = CachingClient(inner, model="m", cache_dir=tmp_path)
+    client.generate("sys", "user")
+
+    for entry in tmp_path.rglob("*.json"):
+        entry.write_text("{ this is not valid json", encoding="utf-8")
+
+    result = client.generate("sys", "user")
+    assert result == inner.response
+    assert inner.calls == 2, "a corrupt entry must re-query rather than crash"
+
+
+def test_failed_request_is_not_cached(tmp_path: Path):
+    """A quota failure or malformed response must never be memoized as if
+    it were a real answer."""
+
+    class FailingThenWorkingClient:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, system_prompt, user_prompt):
+            self.calls += 1
+            if self.calls == 1:
+                raise ScannerError("boom")
+            return '{"vulnerabilities": []}'
+
+    inner = FailingThenWorkingClient()
+    client = CachingClient(inner, model="m", cache_dir=tmp_path)
+
+    with pytest.raises(ScannerError):
+        client.generate("sys", "user")
+
+    assert client.generate("sys", "user") == '{"vulnerabilities": []}'
+    assert inner.calls == 2
+
+
+def test_cache_survives_unwritable_directory(tmp_path: Path, monkeypatch):
+    """An unwritable cache is a missed optimization, not a scan failure."""
+    inner = CountingClient()
+    client = CachingClient(inner, model="m", cache_dir=tmp_path / "cache")
+
+    def boom(*args, **kwargs):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(Path, "write_text", boom)
+    assert client.generate("sys", "user") == inner.response
+
+
+def test_scanner_uses_cache_on_second_run(tmp_path: Path):
+    """End-to-end through Scanner: re-scanning unchanged files costs nothing."""
+    (tmp_path / "a.py").write_text("x = 1\n")
+    inner = CountingClient(json.dumps({"vulnerabilities": [_finding()]}))
+    cache_dir = tmp_path / "cache"
+
+    first = Scanner(CachingClient(inner, model="m", cache_dir=cache_dir)).scan(tmp_path)
+    calls_after_first = inner.calls
+    second = Scanner(CachingClient(inner, model="m", cache_dir=cache_dir)).scan(tmp_path)
+
+    assert inner.calls == calls_after_first, "unchanged files must not re-query"
+    assert first.summary.total_findings == second.summary.total_findings
+
+
+def test_edited_file_misses_the_cache(tmp_path: Path):
+    """The other half of correctness: changed code must be re-scanned."""
+    target = tmp_path / "a.py"
+    target.write_text("x = 1\n")
+    inner = CountingClient()
+    cache_dir = tmp_path / "cache"
+
+    Scanner(CachingClient(inner, model="m", cache_dir=cache_dir)).scan(tmp_path)
+    calls_after_first = inner.calls
+
+    target.write_text("x = 1\ny = evil()\n")
+    Scanner(CachingClient(inner, model="m", cache_dir=cache_dir)).scan(tmp_path)
+
+    assert inner.calls > calls_after_first, "edited file must re-query the model"
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -1181,6 +1347,50 @@ def test_cli_baseline_still_fails_on_genuinely_new_finding(tmp_path: Path, monke
         cli_module.main, ["--target", str(src), "--baseline", str(baseline_path)]
     )
     assert result.exit_code == 1  # different CWE at a different line: not the accepted finding
+
+
+def test_cli_no_cache_flag_bypasses_the_cache(tmp_path: Path, monkeypatch):
+    from click.testing import CliRunner
+
+    from scanner import cli as cli_module
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.py").write_text("x = 1" + chr(92) + "n")
+
+    inner = CountingClient()
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(cli_module, "GeminiClient", lambda **kw: inner)
+
+    args = ["--target", str(src), "--cache-dir", str(tmp_path / "c"), "--no-cache"]
+    CliRunner().invoke(cli_module.main, args)
+    CliRunner().invoke(cli_module.main, args)
+
+    assert inner.calls == 2, "--no-cache must re-query on every run"
+    assert not (tmp_path / "c").exists(), "--no-cache must not write cache entries"
+
+
+def test_cli_reuses_cache_across_invocations(tmp_path: Path, monkeypatch):
+    from click.testing import CliRunner
+
+    from scanner import cli as cli_module
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.py").write_text("x = 1" + chr(92) + "n")
+
+    inner = CountingClient()
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(cli_module, "GeminiClient", lambda **kw: inner)
+
+    args = ["--target", str(src), "--cache-dir", str(tmp_path / "c")]
+    CliRunner().invoke(cli_module.main, args)
+    calls_after_first = inner.calls
+    result = CliRunner().invoke(cli_module.main, args)
+
+    assert inner.calls == calls_after_first, "second run must be served from cache"
+    assert "cache:" in result.output
+    assert "1 hit(s)" in result.output
 
 
 def test_cli_exits_2_when_truncated_even_with_findings(tmp_path: Path, monkeypatch):

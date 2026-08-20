@@ -12,6 +12,7 @@ from rich.console import Console
 
 from .baseline import apply_baseline, load_baseline, save_baseline
 from .baseline import update_baseline as merge_baseline
+from .cache import DEFAULT_CACHE_DIR, CachingClient
 from .core import (
     DEFAULT_MODEL,
     GeminiClient,
@@ -100,6 +101,18 @@ def _has_supported_output_extension(path: Path) -> bool:
     help="Always exit 0, even when findings exist.",
 )
 @click.option(
+    "--cache-dir",
+    type=click.Path(path_type=Path),
+    default=DEFAULT_CACHE_DIR,
+    show_default=True,
+    help="Directory for cached LLM responses.",
+)
+@click.option(
+    "--no-cache",
+    is_flag=True,
+    help="Bypass the response cache and re-query the model for every chunk.",
+)
+@click.option(
     "--baseline",
     "baseline_path",
     type=click.Path(path_type=Path),
@@ -125,6 +138,8 @@ def main(
     chunk_lines: int | None,
     quiet: bool,
     no_fail: bool,
+    cache_dir: Path,
+    no_cache: bool,
     baseline_path: Path | None,
     update_baseline: bool,
 ) -> None:
@@ -157,8 +172,13 @@ def main(
         err_console.print(f"[red]error:[/red] {exc}")
         sys.exit(EXIT_ERROR)
 
+    # Wrapping rather than modifying GeminiClient means the rate limiter,
+    # which lives inside it, only paces actual network calls -- cache hits
+    # cost neither quota nor pacing delay.
+    caching_client = None if no_cache else CachingClient(client, model=model, cache_dir=cache_dir)
+
     scanner = Scanner(
-        client=client,
+        client=caching_client or client,
         model=model,
         severity_threshold=threshold,
         chunk_lines=chunk_lines,
@@ -191,6 +211,13 @@ def main(
 
     if report.summary.files_discovered == 0:
         console.print("[yellow]No supported source files found under the target.[/yellow]")
+
+    if caching_client and caching_client.stats.total:
+        stats = caching_client.stats
+        console.print(
+            f"[dim]cache: {stats.hits} hit(s), {stats.misses} miss(es) "
+            f"({cache_dir})[/dim]"
+        )
 
     if baseline_path:
         existing_baseline = load_baseline(baseline_path)

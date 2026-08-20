@@ -224,12 +224,30 @@ Nothing blocking. The prompt-validation item is resolved as far as the free tier
 
 ---
 
-## Phase 3 — Scale & Performance 🔜 Planned
+## Phase 3 — Scale & Performance 🟡 In Progress
 
-- Concurrent file scanning sharing one `RateLimiter`.
-- Response caching keyed on file content hash, to skip unchanged files.
-- Git-diff mode (`--changed-only`) for fast PR scans.
-- Repository context pass to enable cross-file reasoning.
+**Dates:** started 2026-08-17
+**Status:** 110/110 tests passing
+
+### 3a. Response caching ✅
+
+New module `scanner/cache.py`. Chosen as the first Phase 3 item because it needs no API quota to build or test, and because it directly attacks the constraint that had been limiting every previous phase: a free-tier key allows ~20 requests/day, and a chunked file consumes several, so re-scanning a repo after editing two files would burn a day's budget re-analyzing unchanged code.
+
+- **A decorator over the `LLMClient` protocol**, not a change to `GeminiClient`. `Scanner` required zero changes. It also places the cache *outside* the rate limiter (which lives inside `GeminiClient`), so a hit costs neither quota nor the RPM pacing sleep — embedding it inside the client would have made every hit wait out the rate-limit interval for nothing.
+- **Key = `sha256(cache_format_version, model, system_prompt, user_prompt)`.** `user_prompt` already carries file path, language, chunk boundaries and the numbered source, so content and chunking changes are covered for free. Including `system_prompt` is not defensive padding — it is a direct response to this project's own history: the prompt was retuned in 2f, and a cache blind to that would have silently served pre-tuning results while 2j/2k believed they were measuring the new prompt.
+- **On by default.** Defensible for a security tool specifically because the key is content-addressed: a hit can only occur when file, prompt and model are byte-identical to a previous run, so the cached answer is the answer a fresh query would give. Given model non-determinism this makes runs *more* reproducible, not less. `--no-cache` and a disposable cache directory cover the residual risk of a provider improving a model behind a stable id.
+- **A broken cache may never break a scan.** Writes happen only after a successful response, so quota errors and malformed responses propagate uncached rather than being memoized as answers; corrupt entries degrade to misses; an unwritable directory is swallowed.
+
+**Bug found and fixed during implementation, worth recording.** Wiring caching on by default immediately broke three existing CLI tests. Cause: `--cache-dir` defaults to a *relative* path, so the cache landed in the repo root during tests, and tests scanning identical trivial content (`x = 1`) produced identical cache keys — one test's findings leaked into another test's supposedly-clean scan, turning an expected exit `0` into exit `1`. Fixed with an autouse fixture that runs every test in an isolated working directory, which also stops the suite writing a cache directory into the repo. The failure was a genuine test-isolation gap that the feature merely exposed.
+
+- Covered by 12 new tests: hit/miss behavior, persistence across client instances, key invalidation for each of model/system-prompt/user-prompt independently, corrupt-entry and unwritable-directory degradation, failures not being cached, end-to-end reuse through `Scanner`, edited files correctly missing, and both CLI flags.
+- Full rationale in [DESIGN.md §4.12](DESIGN.md#412-response-caching); walkthrough in [FLOW.md Module 5b](FLOW.md#module-5b--response-caching).
+
+### Remaining in Phase 3
+
+- Concurrent file scanning sharing one `RateLimiter` — the largest remaining win; serial scanning is the reason a 78-file repo is currently impractical.
+- Git-diff mode (`--changed-only`) for fast PR scans. Composes well with 3a: caching already makes unchanged files cheap, and this would avoid even discovering them.
+- Repository context pass to enable cross-file reasoning — the hardest item, and the one that addresses the per-file-context limitation carried since Phase 1.
 
 ---
 

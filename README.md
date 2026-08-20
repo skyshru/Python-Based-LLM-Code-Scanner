@@ -32,7 +32,9 @@ This tool is designed to **complement** rule-based scanners (Semgrep, Bandit, tf
 | **Smart file filtering** | Skips `.git`, `node_modules`, `__pycache__`, `.venv`, lockfiles, binaries, oversized blobs |
 | **Chunking with overlap** | Large files are split into overlapping line windows so nothing straddles a boundary |
 | **Rate limiting + retry** | Client-side RPM pacing and exponential backoff with jitter on `429`/`5xx` |
-| **Three output modes** | Colour-coded terminal, machine-readable JSON, shareable Markdown |
+| **Response caching** | Unchanged files are served from disk, so re-scans cost no API quota |
+| **Baseline suppression** | Accept known findings once; only new ones fail the build |
+| **Four output modes** | Colour-coded terminal, machine-readable JSON, shareable Markdown, SARIF for GitHub Code Scanning |
 | **CI-native exit codes** | `0` clean · `1` findings at/above threshold · `2` tool error |
 
 ---
@@ -104,8 +106,24 @@ llm-appsec-scanner -t ./terraform -o security-report.md
 | `--chunk-lines` | auto | Lines per request for large files |
 | `--quiet`, `-q` | off | Summary table only |
 | `--no-fail` | off | Always exit `0` (report-only mode) |
+| `--cache-dir PATH` | `.llm-appsec-cache` | Where cached model responses are stored |
+| `--no-cache` | off | Re-query the model for every chunk, ignoring the cache |
 | `--baseline PATH` | — | Suppress findings already accepted in this baseline file |
 | `--update-baseline` | off | Fold every current finding into `--baseline` instead of suppressing; always exits `0` |
+
+### Response caching
+
+Scans are cached on disk by default. The cache key is a hash of the **file content, the system prompt, and the model id** — so an unchanged file re-scanned with the same prompt on the same model costs nothing, while editing the file, tuning the prompt, or switching models all correctly re-query.
+
+```bash
+llm-appsec-scanner -t ./src                  # first run: every chunk queried
+llm-appsec-scanner -t ./src                  # re-run: served from cache, no API calls
+llm-appsec-scanner -t ./src --no-cache       # force a fresh scan
+```
+
+This matters most on a metered API. Free-tier Gemini keys allow only ~20 requests/day, and a large file consumes several (it is chunked), so re-scanning a repo after changing two files would otherwise burn a day's budget re-analyzing code that did not change.
+
+Cached responses are keyed by content, not filename, so the answer for an unchanged file is identical to what a fresh scan would return — caching makes runs *more* reproducible, not less. The cache directory is safe to delete at any time and should not be committed (it is in `.gitignore`).
 
 ### Accepting risk with `--baseline`
 
@@ -353,6 +371,7 @@ pytest -q -k reporter          # one area
 - [ ] Cross-file taint analysis with a repository-level context pass
 - [x] SARIF output for GitHub Code Scanning
 - [x] Baseline/suppression file to ignore accepted risks
+- [x] Response caching keyed on file content, to skip unchanged files
 - [ ] Concurrent file scanning with a shared rate limiter
 - [ ] Auto-fix mode that applies `code_patch` as a git diff
 
