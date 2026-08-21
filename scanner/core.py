@@ -161,9 +161,16 @@ class LLMClient(Protocol):
 
 @dataclass
 class RateLimitConfig:
-    """Client-side pacing and retry policy."""
+    """Client-side pacing and retry policy.
 
-    requests_per_minute: int = 15
+    The default RPM targets Google's free tier, which is the documented
+    audience. 15 was observed producing
+    `GenerateRequestsPerMinutePerProjectPerModel-FreeTier` 429s on a real
+    scan; paid tiers should raise `--rpm` rather than have free-tier users
+    hit a wall out of the box.
+    """
+
+    requests_per_minute: int = 10
     max_retries: int = 4
     base_backoff_seconds: float = 2.0
     max_backoff_seconds: float = 60.0
@@ -268,9 +275,23 @@ class GeminiClient:
                 last_error = exc
                 if not _is_retryable(exc) or attempt == self.config.max_retries:
                     break
-                self._sleep(self._backoff_for(attempt))
+                self._sleep(self._delay_for(attempt, exc))
 
         raise ScannerError(f"LLM request failed: {last_error}") from last_error
+
+    def _delay_for(self, attempt: int, exc: Exception) -> float:
+        """Wait the longer of our backoff and the server's own advice.
+
+        Google returns a `retryDelay` on 429s telling us exactly when the
+        window reopens. Ignoring it loses files: an observed per-minute
+        429 asked for 37.6s while our schedule (2/4/8/16) gave up after
+        30s total, failing the file ~7s before it would have succeeded.
+        """
+        delay = self._backoff_for(attempt)
+        advised = _retry_delay_seconds(exc)
+        if advised is not None:
+            delay = max(delay, advised)
+        return min(delay, self.config.max_backoff_seconds)
 
     def _backoff_for(self, attempt: int) -> float:
         delay = min(
@@ -294,6 +315,17 @@ _RETRYABLE_MARKERS = (
     "unavailable",
     "connection",
 )
+
+
+def _retry_delay_seconds(exc: Exception) -> float | None:
+    """Extract the server-advised retry delay, e.g. "retryDelay": "37s"."""
+    match = re.search(r"retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s", str(exc))
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
 
 
 def _is_retryable(exc: Exception) -> bool:

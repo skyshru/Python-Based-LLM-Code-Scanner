@@ -12,6 +12,7 @@ from rich.console import Console
 
 from scanner.core import (
     DailyQuotaExceededError,
+    _retry_delay_seconds,
     GeminiClient,
     MissingAPIKeyError,
     RateLimitConfig,
@@ -488,6 +489,43 @@ def test_retryable_errors_detected(message):
 @pytest.mark.parametrize("message", ["400 Invalid argument", "401 Unauthorized"])
 def test_non_retryable_errors_detected(message):
     assert not _is_retryable(Exception(message))
+
+
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ("{'@type': '...RetryInfo', 'retryDelay': '37s'}", 37.0),
+        ('"retryDelay": "12.5s"', 12.5),
+        ("retryDelay: 5s", 5.0),
+        ("503 UNAVAILABLE with no advice", None),
+        ("retryDelay: soon", None),
+    ],
+)
+def test_retry_delay_parsed_from_server_response(message, expected):
+    assert _retry_delay_seconds(Exception(message)) == expected
+
+
+def test_delay_honours_server_advice_over_short_backoff(monkeypatch):
+    """A real per-minute 429 asked for 37.6s while our 2/4/8/16 schedule
+    gave up after 30s total, losing the file ~7s before it would have
+    succeeded. The server's advice must win when it is longer."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    client = GeminiClient.__new__(GeminiClient)
+    client.config = RateLimitConfig(base_backoff_seconds=2.0, max_backoff_seconds=60.0)
+
+    exc = Exception("429 ... 'retryDelay': '37s'")
+    assert client._delay_for(0, exc) >= 37.0
+
+    # ...but our own backoff still wins when it is the longer of the two.
+    modest = Exception("429 ... 'retryDelay': '1s'")
+    assert client._delay_for(3, modest) >= 16.0
+
+
+def test_delay_never_exceeds_max_backoff():
+    client = GeminiClient.__new__(GeminiClient)
+    client.config = RateLimitConfig(max_backoff_seconds=30.0)
+    absurd = Exception("429 ... 'retryDelay': '3600s'")
+    assert client._delay_for(0, absurd) == 30.0
 
 
 def test_daily_quota_marker_detected():

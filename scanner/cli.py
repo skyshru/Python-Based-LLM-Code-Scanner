@@ -73,9 +73,9 @@ def _has_supported_output_extension(path: Path) -> bool:
 @click.option(
     "--rpm",
     type=int,
-    default=15,
+    default=10,
     show_default=True,
-    help="Client-side request-per-minute cap.",
+    help="Client-side request-per-minute cap. Raise it on a paid tier.",
 )
 @click.option(
     "--max-retries",

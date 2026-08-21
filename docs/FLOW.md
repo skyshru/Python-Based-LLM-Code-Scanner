@@ -56,7 +56,7 @@ llm-appsec-scanner/
 │   ├── baseline.py        cross-run suppression of accepted findings
 │   └── cache.py           content-addressed LLM response cache
 ├── tests/
-│   ├── test_scanner.py    140 tests, no network
+│   ├── test_scanner.py    147 tests, no network
 │   └── vulnerable_samples/
 ├── docs/
 │   ├── DESIGN.md          architecture and rationale
@@ -469,7 +469,7 @@ The `2`-vs-`1` split matters in CI: a pipeline can distinguish "the scanner foun
 
 ## Module 7 — Testing
 
-**File:** [`tests/test_scanner.py`](../tests/test_scanner.py) — 140 tests, no network, no API key.
+**File:** [`tests/test_scanner.py`](../tests/test_scanner.py) — 147 tests, no network, no API key.
 
 ### The `FakeClient`
 
@@ -614,7 +614,7 @@ for m in client.models.list():
 | `404 NOT_FOUND … model is no longer available` | Google retired the model id | Pick a current one: `--model gemini-3.7-flash`, or list what your key can reach (see below) |
 | Key looks set but scanner says it isn't | `.env` edited but not saved, or the placeholder left in place | Save the file. Note `your-api-key-here` is *truthy*, so it passes the guard and fails later at the API |
 | Scanner uses an unexpected model | `LLM_APPSEC_MODEL` in `.env` overriding the default | Precedence is `--model` → `$LLM_APPSEC_MODEL` → `DEFAULT_MODEL` |
-| `LLM request failed: 429 …` after retries | Sustained per-minute rate limiting (not a daily cap) | Lower `--rpm`, raise `--max-retries`, or narrow `--target` |
+| `LLM request failed: 429 …` after retries | Sustained per-minute rate limiting (not a daily cap) | The client now honours the server's own `retryDelay`, so this should be rare. If it persists, lower `--rpm` further |
 | `scan incomplete: Stopped after N of M files …`, exit `2` | Daily API quota exhausted mid-scan | Wait for the provider's daily reset, switch `--model` to one with separate quota, or move to a paid tier. The scan stops immediately rather than retrying every remaining file — see [DESIGN.md §4.7a](DESIGN.md#47a-daily-quota-exhaustion-is-not-a-per-file-error) |
 | `Model response did not contain JSON` | Model returned prose (rare with schema) | Usually transient; re-run. Persistent → check the model id |
 | "No supported source files found" | Extensions unsupported, or everything filtered | Check `SUPPORTED_EXTENSIONS` and the ignore lists |

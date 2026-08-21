@@ -227,7 +227,7 @@ Nothing blocking. The prompt-validation item is resolved as far as the free tier
 ## Phase 3 — Scale & Performance 🟡 In Progress
 
 **Dates:** started 2026-08-17
-**Status:** 140/140 tests passing
+**Status:** 147/147 tests passing
 
 ### 3a. Response caching ✅
 
@@ -291,6 +291,22 @@ Prompted by a concrete planning question — *could the Tesla scan be finished i
 
 - 21 new tests: filename and content-marker detection, three false-positive guards (prose mentioning generation, a marker below the header window, ordinary source), the discovery split, default-exclude vs `--include-generated`, explicit-target honouring, and the count surviving a summary rebuild.
 - Rationale in [DESIGN.md 4.14](DESIGN.md#414-generated-code-exclusion).
+
+### 3d. Tesla scan started; throughput bug found on day 1 ✅
+
+Began the real scan of `teslamotors/vehicle-command` (102 files after generated-code exclusion). Day 1 reached 12 of 102 files, 10 scanned cleanly, **0 findings so far**, then stopped correctly on the daily cap with the report and cache preserved.
+
+**Day 1 surfaced a real bug that was costing files.** Two files failed with 429s citing `GenerateRequestsPerMinutePerProjectPerModel-FreeTier` — the **per-minute** quota, not the daily one. The daily-quota detector correctly ignored them (the discrimination from 3g works), but the retry schedule then gave up too early:
+
+- Server response said `retryDelay: 37.6s`.
+- Our backoff schedule is 2 + 4 + 8 + 16 = **30s across 4 retries**.
+- We abandoned both files roughly **7 seconds before the minute window reopened**, while the API was explicitly telling us when to come back.
+
+**Fix:** `_delay_for()` now takes the longer of our computed backoff and the server-advised `retryDelay`, still capped at `max_backoff_seconds`. Ignoring a delay the provider hands you is simply a bug; our jittered exponential backoff is a guess, and theirs is the actual answer.
+
+**Also lowered the default `--rpm` from 15 to 10.** Hitting a *per-minute* cap at 15 is direct evidence that 15 exceeds this tier's limit, and the documented audience for this tool is free-tier keys. Paid users should raise it rather than have every free-tier user hit a wall out of the box.
+
+- 7 new tests: `retryDelay` parsing across formats (including malformed and absent), server advice winning over a short backoff, our backoff winning when it is longer, and the `max_backoff_seconds` ceiling holding against an absurd advised delay.
 
 ### Remaining in Phase 3
 

@@ -103,7 +103,7 @@ llm-appsec-scanner -t ./terraform -o security-report.md
 | `--output`, `-o` | — | Report path; format inferred from `.json` / `.md` / `.sarif` |
 | `--severity-threshold` | `LOW` | Minimum severity to report and fail on |
 | `--model` | `gemini-3.7-flash` | Gemini model id. Falls back to `$LLM_APPSEC_MODEL`, then the built-in default |
-| `--rpm` | `15` | Client-side requests-per-minute cap |
+| `--rpm` | `10` | Client-side requests-per-minute cap; raise it on a paid tier |
 | `--max-retries` | `4` | Retries on quota/transient errors |
 | `--concurrency` | `4` | Files scanned in parallel; total request rate still bounded by `--rpm` |
 | `--include-generated` | off | Also scan machine-generated files (protobuf stubs, codegen output) |
