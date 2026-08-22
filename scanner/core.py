@@ -431,6 +431,7 @@ class Scanner:
         chunk_lines: int | None = None,
         concurrency: int = DEFAULT_CONCURRENCY,
         include_generated: bool = False,
+        only_paths: set[Path] | None = None,
     ):
         self.client = client
         self.model = model
@@ -438,6 +439,9 @@ class Scanner:
         self.chunk_lines = chunk_lines
         self.concurrency = max(1, concurrency)
         self.include_generated = include_generated
+        # None means 'no restriction'. An *empty* set is meaningful and
+        # different: nothing changed, so nothing should be scanned.
+        self.only_paths = only_paths
 
     def scan_file(self, source: SourceFile) -> FileScanResult:
         chunks = chunk_file(
@@ -486,6 +490,9 @@ class Scanner:
         if self.include_generated:
             paths = sorted(paths + generated)
             generated = []
+        if self.only_paths is not None:
+            wanted = {Path(p).resolve() for p in self.only_paths}
+            paths = [p for p in paths if Path(p).resolve() in wanted]
         total = len(paths)
 
         report = ScanReport(

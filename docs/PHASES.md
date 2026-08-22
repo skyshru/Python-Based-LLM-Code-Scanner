@@ -227,7 +227,7 @@ Nothing blocking. The prompt-validation item is resolved as far as the free tier
 ## Phase 3 — Scale & Performance 🟡 In Progress
 
 **Dates:** started 2026-08-17
-**Status:** 147/147 tests passing
+**Status:** 160/160 tests passing
 
 ### 3a. Response caching ✅
 
@@ -308,9 +308,20 @@ Began the real scan of `teslamotors/vehicle-command` (102 files after generated-
 
 - 7 new tests: `retryDelay` parsing across formats (including malformed and absent), server advice winning over a short backoff, our backoff winning when it is longer, and the `max_backoff_seconds` ceiling holding against an absurd advised delay.
 
+### 3e. Git-diff mode (`--changed-since`) ✅
+
+New module `scanner/gitdiff.py` plus `Scanner(only_paths=...)`. A pull request needs its own diff reviewed, not the whole repository. Built while the Tesla scan ran in the background, since it needs no API quota and touches nothing in the system prompt — changing that mid-scan would have invalidated the accumulated cache.
+
+- **Untracked files are included by default.** `git diff --name-only <ref>` does not list them, so a naive implementation silently skips every newly added file — precisely the code a PR scan most needs to see. `changed_files()` unions the diff with `git ls-files --others --exclude-standard`.
+- **Deleted paths are dropped.** Git reports a deletion as a change, but there is no content left to scan; passing it through would manufacture a spurious unreadable-file error.
+- **`None` and the empty set mean different things.** `only_paths=None` is "no restriction"; `only_paths=set()` is "the diff was empty, scan nothing". A falsy check would have treated an empty diff as "scan the entire repo" — the opposite of the request, and expensive on a metered API. Tested in both directions.
+- **A bad ref exits `2` before the client is constructed**, so a typo costs no quota, consistent with the existing `--output` extension check.
+- **Composes with the cache**, which is the real point: the cache makes an unchanged file cheap once discovered, and this avoids discovering it at all. Repeated CI scans become close to free.
+- 13 new tests, run against **real throwaway git repositories** rather than mocks — the entire purpose of the module is correct interaction with git, which a mock would assume rather than verify.
+
 ### Remaining in Phase 3
 
-- Git-diff mode (`--changed-only`) for fast PR scans. Composes well with 3a: caching already makes unchanged files cheap, and this would avoid even discovering them.
+- ~~Git-diff mode~~ → done (3e).
 - Repository context pass to enable cross-file reasoning — the hardest item, and the one that addresses the per-file-context limitation carried since Phase 1.
 
 ---

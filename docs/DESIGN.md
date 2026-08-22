@@ -1,7 +1,7 @@
 # Design Document — llm-appsec-scanner
 
 **Status:** Living document · updated as the system evolves
-**Last updated:** Phase 3 (2026-08-17)
+**Last updated:** Phase 3 (2026-08-22)
 
 ---
 
@@ -45,7 +45,8 @@ scanner/
 ├── models.py        Schemas, validation, severity semantics.     No dependencies on siblings.
 ├── reporter.py      ScanReport → terminal / JSON / MD / SARIF.   Read-only over models.
 ├── baseline.py      Cross-run suppression of accepted findings.  Policy over models.
-└── cache.py         Content-addressed LLMClient decorator.       Wraps, never modifies.
+├── cache.py         Content-addressed LLMClient decorator.       Wraps, never modifies.
+└── gitdiff.py       Changed-file discovery via git.              Subprocess only.
 ```
 
 The dependency graph is strictly acyclic and points inward toward `models.py`:
@@ -56,6 +57,7 @@ cli ──▶ core ──▶ file_handler ──▶ models
  │        │                          │
  ├──▶ cache (decorates LLMClient) ───┤
  ├──▶ baseline ──────────────────────┤
+ ├──▶ gitdiff (subprocess only) ─────┤
  └──▶ reporter ──────────────────────┘
 ```
 
@@ -278,6 +280,20 @@ Two reasons to skip them, and the second is the one that matters:
 **Test files are deliberately not excluded**, even though they were another 23% of that repo's cost. Test fixtures are a well-known place for real credentials to leak, so those findings have genuine value — unlike generated code, where they have none. Cost alone was not sufficient justification.
 
 **The count is surfaced, not silent.** `ScanSummary.generated_files_skipped` appears in every output format, so a user always knows why coverage differs from their file count. Note that `rebuild_summary()` preserves this value when called without it: the CLI rebuilds the summary again after baseline processing, and a naive default of `0` would have silently zeroed a count that call site knows nothing about.
+
+### 4.15 Scanning only changed files
+
+`scanner/gitdiff.py` plus `Scanner(only_paths=...)`. A PR needs its diff reviewed, not the repository.
+
+**Untracked files are included by default.** `git diff --name-only <ref>` does not list them, so a naive implementation would silently skip every newly added file — precisely the code a PR scan most needs to see. `changed_files()` therefore unions the diff with `git ls-files --others --exclude-standard`.
+
+**Deleted paths are filtered out.** Git reports a deletion as a change, but there is no content to scan; passing it through would produce a spurious unreadable-file error.
+
+**`None` and the empty set mean different things**, and conflating them would be a silent correctness bug. `only_paths=None` means "no restriction, scan everything". `only_paths=set()` means "the diff was empty, scan nothing". A falsy check (`if not self.only_paths`) would treat an empty diff as "scan the whole repo" — the opposite of what the user asked for, and expensive on a metered API. The code tests `is not None` explicitly and a test pins both behaviours.
+
+**Resolved before the client is constructed**, so an unknown ref exits `2` without spending quota — the same principle as the `--output` extension check in §4.7.
+
+**Composition with the cache is the point.** The cache already makes an unchanged file cheap once discovered; `--changed-since` avoids discovering it at all. Together they make repeated CI scans nearly free: the diff is small, and anything in it that was seen before is already cached.
 
 ---
 

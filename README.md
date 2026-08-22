@@ -34,6 +34,7 @@ This tool is designed to **complement** rule-based scanners (Semgrep, Bandit, tf
 | **Chunking with overlap** | Large files are split into overlapping line windows so nothing straddles a boundary |
 | **Rate limiting + retry** | Client-side RPM pacing and exponential backoff with jitter on `429`/`5xx` |
 | **Concurrent scanning** | Files scanned in parallel against one shared rate limiter |
+| **PR-only scans** | `--changed-since` restricts a scan to a git diff |
 | **Response caching** | Unchanged files are served from disk, so re-scans cost no API quota |
 | **Baseline suppression** | Accept known findings once; only new ones fail the build |
 | **Four output modes** | Colour-coded terminal, machine-readable JSON, shareable Markdown, SARIF for GitHub Code Scanning |
@@ -106,6 +107,7 @@ llm-appsec-scanner -t ./terraform -o security-report.md
 | `--rpm` | `10` | Client-side requests-per-minute cap; raise it on a paid tier |
 | `--max-retries` | `4` | Retries on quota/transient errors |
 | `--concurrency` | `4` | Files scanned in parallel; total request rate still bounded by `--rpm` |
+| `--changed-since GIT_REF` | — | Only scan files changed since this git ref |
 | `--include-generated` | off | Also scan machine-generated files (protobuf stubs, codegen output) |
 | `--chunk-lines` | auto | Lines per request for large files |
 | `--quiet`, `-q` | off | Summary table only |
@@ -114,6 +116,26 @@ llm-appsec-scanner -t ./terraform -o security-report.md
 | `--no-cache` | off | Re-query the model for every chunk, ignoring the cache |
 | `--baseline PATH` | — | Suppress findings already accepted in this baseline file |
 | `--update-baseline` | off | Fold every current finding into `--baseline` instead of suppressing; always exits `0` |
+
+### Scanning only what changed
+
+A pull request only needs its own diff reviewed. `--changed-since` restricts the scan to files that differ from a git ref:
+
+```bash
+llm-appsec-scanner -t . --changed-since HEAD           # uncommitted work
+llm-appsec-scanner -t . --changed-since main           # everything since main
+llm-appsec-scanner -t . --changed-since origin/main    # typical PR scan
+```
+
+Newly added untracked files **are** included — a brand-new file is exactly what a PR scan must not miss, and git does not report it as a diff against any ref. Deleted files are dropped, since there is nothing left to scan.
+
+A bad ref fails before the API client is constructed, so a typo costs no quota. In CI this pairs naturally with the exit codes:
+
+```yaml
+      - name: Scan changed files only
+        run: |
+          llm-appsec-scanner             --target .             --changed-since origin/${{ github.base_ref }}             --severity-threshold HIGH
+```
 
 ### Generated code is skipped
 
@@ -415,6 +437,7 @@ pytest -q -k reporter          # one area
 - [x] Baseline/suppression file to ignore accepted risks
 - [x] Response caching keyed on file content, to skip unchanged files
 - [x] Concurrent file scanning with a shared rate limiter
+- [x] Git-diff mode (`--changed-since`) for fast PR scans
 - [ ] Auto-fix mode that applies `code_patch` as a git diff
 
 ---

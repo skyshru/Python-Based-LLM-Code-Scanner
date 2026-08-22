@@ -54,9 +54,10 @@ llm-appsec-scanner/
 │   ├── file_handler.py    traversal, filtering, chunking
 │   ├── reporter.py        JSON / Markdown / SARIF / terminal
 │   ├── baseline.py        cross-run suppression of accepted findings
-│   └── cache.py           content-addressed LLM response cache
+│   ├── cache.py           content-addressed LLM response cache
+│   └── gitdiff.py         changed-file discovery for PR scans
 ├── tests/
-│   ├── test_scanner.py    147 tests, no network
+│   ├── test_scanner.py    160 tests, no network
 │   └── vulnerable_samples/
 ├── docs/
 │   ├── DESIGN.md          architecture and rationale
@@ -469,7 +470,7 @@ The `2`-vs-`1` split matters in CI: a pipeline can distinguish "the scanner foun
 
 ## Module 7 — Testing
 
-**File:** [`tests/test_scanner.py`](../tests/test_scanner.py) — 147 tests, no network, no API key.
+**File:** [`tests/test_scanner.py`](../tests/test_scanner.py) — 160 tests, no network, no API key.
 
 ### The `FakeClient`
 
@@ -624,6 +625,8 @@ for m in client.models.list():
 | Line numbers look wrong | Reporting bug on a chunked file | Confirm the file is >400 lines; check `number_lines` offsets |
 | Progress lines appear out of order | Files are scanned in parallel (default 4 workers) | Expected. The *report* is always reassembled in discovery order; only live progress interleaves. `--concurrency 1` restores serial output |
 | Raising `--concurrency` does not speed anything up | The `--rpm` cap is the binding limit, not request latency | Expected below ~4 workers on a free tier. Raise `--rpm` too, or accept the plateau — see [DESIGN.md 4.13](DESIGN.md#413-concurrent-scanning) |
+| `--changed-since` scanned nothing | The diff against that ref is empty | Correct behaviour, not a bug: an empty diff means nothing to scan. Check with `git diff --name-only <ref>` |
+| `--changed-since` missed a new file | Only if `include_untracked` was disabled | Untracked files are included by default precisely so new files are not missed |
 | Fewer files scanned than expected | Generated files (protobuf stubs, codegen output) are skipped by default | Expected; the count is printed. `--include-generated` scans them |
 | A file you consider hand-written was skipped | It matched a generated filename pattern, or has a `Code generated`/`@generated` banner in its first 20 lines | Scan it explicitly by path (always honoured), or pass `--include-generated` |
 | Scan returns instantly with no API calls | Every chunk was served from the response cache | Expected after an unchanged re-run. `--no-cache` forces a fresh scan; the `cache: N hit(s)` line reports it |

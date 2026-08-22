@@ -16,3 +16,5 @@ htmlcov/
 .vscode/
 .claude/
 .llm-appsec-cache/
+day2.log
+tesla.report.md

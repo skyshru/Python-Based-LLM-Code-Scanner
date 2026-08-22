@@ -35,6 +35,7 @@ from scanner.file_handler import (
     SourceFile,
 )
 from scanner.cache import CachingClient, ResponseCache
+from scanner.gitdiff import GitError, changed_files, repository_root
 from scanner.baseline import (
     Baseline,
     BaselineEntry,
@@ -951,6 +952,146 @@ def test_render_sarif_marks_suppressed_results():
 
     assert "suppressions" in suppressed_result
     assert "suppressions" not in active_result
+
+
+# --------------------------------------------------------------------------
+# --changed-since / git diff
+# --------------------------------------------------------------------------
+
+
+def _git(args, cwd):
+    import subprocess
+
+    return subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True
+    )
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> Path:
+    """A tiny real repo with one commit. Real git, not a mock -- the point
+    of this module is that it talks to git correctly."""
+    _git(["init", "-q"], tmp_path)
+    _git(["config", "user.email", "t@example.com"], tmp_path)
+    _git(["config", "user.name", "Test"], tmp_path)
+    (tmp_path / "kept.py").write_text("x = 1" + chr(10))
+    (tmp_path / "edited.py").write_text("y = 2" + chr(10))
+    (tmp_path / "removed.py").write_text("z = 3" + chr(10))
+    _git(["add", "."], tmp_path)
+    _git(["commit", "-q", "-m", "init"], tmp_path)
+    return tmp_path
+
+
+def test_changed_files_detects_modification(git_repo: Path):
+    (git_repo / "edited.py").write_text("y = 999" + chr(10))
+    changed = changed_files(git_repo, "HEAD")
+    assert {p.name for p in changed} == {"edited.py"}
+
+
+def test_changed_files_includes_untracked(git_repo: Path):
+    """A brand-new file is exactly what a PR scan must not miss, and git
+    does not report it as a diff against any ref."""
+    (git_repo / "brand_new.py").write_text("import os" + chr(10))
+    changed = changed_files(git_repo, "HEAD")
+    assert "brand_new.py" in {p.name for p in changed}
+
+
+def test_changed_files_can_exclude_untracked(git_repo: Path):
+    (git_repo / "brand_new.py").write_text("import os" + chr(10))
+    changed = changed_files(git_repo, "HEAD", include_untracked=False)
+    assert "brand_new.py" not in {p.name for p in changed}
+
+
+def test_changed_files_drops_deleted_paths(git_repo: Path):
+    """git lists a deletion as a change, but there is nothing left to scan."""
+    (git_repo / "removed.py").unlink()
+    changed = changed_files(git_repo, "HEAD")
+    assert "removed.py" not in {p.name for p in changed}
+
+
+def test_changed_files_unchanged_repo_is_empty(git_repo: Path):
+    assert changed_files(git_repo, "HEAD") == set()
+
+
+def test_changed_files_rejects_unknown_ref(git_repo: Path):
+    with pytest.raises(GitError):
+        changed_files(git_repo, "no-such-ref-anywhere")
+
+
+def test_changed_files_rejects_non_repository(tmp_path: Path):
+    (tmp_path / "loose.py").write_text("x = 1" + chr(10))
+    with pytest.raises(GitError):
+        changed_files(tmp_path, "HEAD")
+
+
+def test_repository_root_resolves_from_a_file(git_repo: Path):
+    assert repository_root(git_repo / "kept.py") == git_repo.resolve()
+
+
+def test_scanner_only_paths_restricts_the_scan(git_repo: Path):
+    (git_repo / "edited.py").write_text("y = 999" + chr(10))
+    client = CountingClient()
+
+    report = Scanner(
+        client, concurrency=1, only_paths=changed_files(git_repo, "HEAD")
+    ).scan(git_repo)
+
+    assert client.calls == 1, "only the changed file should cost a request"
+    assert [r.file_path for r in report.results] == ["edited.py"]
+
+
+def test_scanner_empty_only_paths_scans_nothing(tmp_path: Path):
+    """An *empty* set is meaningful and must differ from None: nothing
+    changed, so nothing should be scanned -- not everything."""
+    (tmp_path / "a.py").write_text("x = 1" + chr(10))
+    client = CountingClient()
+
+    report = Scanner(client, concurrency=1, only_paths=set()).scan(tmp_path)
+
+    assert client.calls == 0
+    assert report.results == []
+
+
+def test_scanner_none_only_paths_scans_everything(tmp_path: Path):
+    (tmp_path / "a.py").write_text("x = 1" + chr(10))
+    client = CountingClient()
+    Scanner(client, concurrency=1, only_paths=None).scan(tmp_path)
+    assert client.calls == 1
+
+
+def test_cli_changed_since_limits_the_scan(git_repo: Path, monkeypatch):
+    from click.testing import CliRunner
+
+    from scanner import cli as cli_module
+
+    (git_repo / "edited.py").write_text("y = 999" + chr(10))
+    inner = CountingClient()
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(cli_module, "GeminiClient", lambda **kw: inner)
+
+    result = CliRunner().invoke(
+        cli_module.main,
+        ["--target", str(git_repo), "--changed-since", "HEAD", "--no-cache"],
+    )
+    assert inner.calls == 1
+    assert "1 file(s) changed since HEAD" in result.output
+
+
+def test_cli_changed_since_bad_ref_exits_2_without_scanning(git_repo: Path, monkeypatch):
+    """A bad ref must fail before the client is built, so it costs no quota."""
+    from click.testing import CliRunner
+
+    from scanner import cli as cli_module
+
+    inner = CountingClient()
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(cli_module, "GeminiClient", lambda **kw: inner)
+
+    result = CliRunner().invoke(
+        cli_module.main, ["--target", str(git_repo), "--changed-since", "bogus-ref"]
+    )
+    assert result.exit_code == 2
+    assert inner.calls == 0
 
 
 # --------------------------------------------------------------------------

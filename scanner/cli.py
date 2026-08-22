@@ -13,6 +13,7 @@ from rich.console import Console
 from .baseline import apply_baseline, load_baseline, save_baseline
 from .baseline import update_baseline as merge_baseline
 from .cache import DEFAULT_CACHE_DIR, CachingClient
+from .gitdiff import GitError, changed_files
 from .core import (
     DEFAULT_CONCURRENCY,
     DEFAULT_MODEL,
@@ -109,6 +110,13 @@ def _has_supported_output_extension(path: Path) -> bool:
     help="Always exit 0, even when findings exist.",
 )
 @click.option(
+    "--changed-since",
+    "changed_since",
+    default=None,
+    metavar="GIT_REF",
+    help="Only scan files changed since this git ref (e.g. HEAD, main, origin/main).",
+)
+@click.option(
     "--include-generated",
     is_flag=True,
     help="Also scan machine-generated files (protobuf stubs, codegen output).",
@@ -152,6 +160,7 @@ def main(
     chunk_lines: int | None,
     quiet: bool,
     no_fail: bool,
+    changed_since: str | None,
     include_generated: bool,
     cache_dir: Path,
     no_cache: bool,
@@ -178,6 +187,19 @@ def main(
         err_console.print("[red]error:[/red] --update-baseline requires --baseline PATH")
         sys.exit(EXIT_ERROR)
 
+    # Resolved before the client is built so a bad ref costs no quota,
+    # consistent with the --output extension check.
+    only_paths = None
+    if changed_since:
+        try:
+            only_paths = changed_files(target, changed_since)
+        except GitError as exc:
+            err_console.print(f"[red]error:[/red] --changed-since {changed_since}: {exc}")
+            sys.exit(EXIT_ERROR)
+        console.print(
+            f"[dim]{len(only_paths)} file(s) changed since {changed_since}[/dim]"
+        )
+
     try:
         client = GeminiClient(
             model=model,
@@ -199,6 +221,7 @@ def main(
         chunk_lines=chunk_lines,
         concurrency=concurrency,
         include_generated=include_generated,
+        only_paths=only_paths,
     )
 
     def on_file_start(path: str, index: int, total: int) -> None:
